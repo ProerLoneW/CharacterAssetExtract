@@ -1,0 +1,470 @@
+#!/usr/bin/env python3
+# -*- coding: utf-8 -*-
+"""Annotate shot clips with MiMo while reusing the global person registry.
+
+Atomic migration of ``lsj/video_process/scripts/annotate_shots_mimo.py``. Reads
+``shots.jsonl`` and an optional ``global_captions.jsonl``, sends each shot
+clip together with the matching global ``subject_registry`` /
+``global_event_timeline`` context to MiMo, validates that any locally written
+``S`` IDs map to the global registry, and writes:
+
+    <output>/<video>/shot_captions/shot_<id>.json
+    <output>/<video>/raw_responses/shot_<id>.txt
+    <output>/<video>/shot_captions.jsonl
+    <output>/<video>/summary.json
+
+Usage::
+
+    python mimo_shot_captioner.py \
+        --input ./outputs/shot_outputs/<video> \
+        --global-input ./outputs/global_caption_outputs/<video> \
+        --output-dir ./outputs/shot_caption_outputs
+"""
+
+from __future__ import annotations
+
+import argparse
+import asyncio
+import json
+import logging
+import re
+import time
+from pathlib import Path
+
+from mimo_caption_client import (
+    build_video_content,
+    default_prompt_path,
+    encode_video_b64,
+    extract_text,
+    find_global_caption_manifest,
+    find_shot_manifest,
+    load_dotenv,
+    parse_json_response,
+    persist_item,
+    resolve_api_key,
+    resolve_base_url,
+    resolve_clip_path,
+    resolve_model,
+    write_jsonl,
+)
+
+LOGGER = logging.getLogger("mimo_shot_captioner")
+
+
+# ---------------------------------------------------------------------------
+# Manifest loading
+# ---------------------------------------------------------------------------
+def find_manifests(input_path: Path) -> list[Path]:
+    if input_path.is_file():
+        if input_path.name != "shots.jsonl":
+            raise ValueError(f"Input file must be shots.jsonl: {input_path}")
+        return [input_path]
+    manifests = sorted(input_path.rglob("shots.jsonl"))
+    if not manifests:
+        raise FileNotFoundError(f"No shots.jsonl found under {input_path}")
+    return manifests
+
+
+def load_records(manifest: Path) -> list[dict]:
+    records = []
+    for line_no, line in enumerate(manifest.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        clip_path = record.get("clip_path")
+        if not clip_path:
+            raise ValueError(f"Missing clip_path at {manifest}:{line_no}; split clips without --no-export")
+        path = resolve_clip_path(clip_path, manifest)
+        if not path.is_file():
+            raise FileNotFoundError(f"Shot clip does not exist: {path}")
+        record = dict(record)
+        record["clip_path"] = str(path)
+        records.append(record)
+    records.sort(key=lambda item: int(item["shot_id"]))
+    return records
+
+
+def load_global_subject_context(input_path: Path | None) -> dict[int, dict]:
+    if input_path is None:
+        return {}
+    manifest = find_global_caption_manifest(input_path)
+    result: dict[int, dict] = {}
+    for line_no, line in enumerate(manifest.read_text(encoding="utf-8").splitlines(), start=1):
+        if not line.strip():
+            continue
+        record = json.loads(line)
+        if record.get("success") is not True:
+            continue
+        payload = record.get("global_caption")
+        if not isinstance(payload, dict):
+            payload = {}
+        nested = payload.get("global_caption")
+        if isinstance(nested, dict):
+            merged = {key: value for key, value in payload.items() if key != "global_caption"}
+            merged.update(nested)
+            payload = merged
+        context = {
+            "global_id": record.get("global_id"),
+            "source_time_range_sec": record.get("time_range_sec"),
+            "global_description": payload.get("global_description")
+            or payload.get("integrated_multimodal_description", ""),
+            "global_scene_description": payload.get("global_scene_description", ""),
+            "subject_registry": payload.get("subject_registry", []),
+            "subject_event_timeline": payload.get("subject_event_timeline", []),
+            "global_event_timeline": payload.get("global_event_timeline", []),
+        }
+        for shot_id in record.get("shot_ids", []):
+            result[int(shot_id)] = context
+    if not result:
+        LOGGER.warning("No global subject context found in %s", manifest)
+    return result
+
+
+# ---------------------------------------------------------------------------
+# Validation and description normalisation
+# ---------------------------------------------------------------------------
+def validate_shot_subject_ids(payload: dict, global_context: dict | None) -> None:
+    """Prevent local S IDs from silently replacing the global person registry."""
+    allowed = {
+        str(item.get("subject_id"))
+        for item in (global_context or {}).get("subject_registry", [])
+        if isinstance(item, dict) and item.get("subject_id")
+    }
+
+    def check(value, field: str) -> None:
+        value = str(value)
+        if "," in value and re.fullmatch(
+            r"(?:unknown|new_subject_candidate|S[1-9][0-9]*)(?:,(?:unknown|new_subject_candidate|S[1-9][0-9]*))+",
+            value,
+        ):
+            for part in value.split(","):
+                check(part, field)
+            return
+        if not global_context or value in {"unknown", "new_subject_candidate"} or value in allowed:
+            return
+        lowered = value.lower().replace("-", "_")
+        if "unknown" in lowered or "new_subject_candidate" in lowered:
+            return
+        if re.fullmatch(r"S[1-9][0-9]*", value):
+            raise ValueError(f"{field} uses unregistered global person ID {value}")
+
+    for index, subject in enumerate(payload.get("subjects", []), start=1):
+        if isinstance(subject, dict) and subject.get("id") is not None:
+            check(subject["id"], f"subjects[{index}].id")
+    for index, event in enumerate(payload.get("visual_events", []), start=1):
+        if isinstance(event, dict):
+            for subject_id in event.get("subject_ids", []):
+                check(subject_id, f"visual_events[{index}].subject_ids")
+    for index, dialogue in enumerate(payload.get("dialogue", []), start=1):
+        if isinstance(dialogue, dict) and dialogue.get("speaker_id") is not None:
+            check(dialogue["speaker_id"], f"dialogue[{index}].speaker_id")
+    phases = {"introduction", "continuation", "escalation", "turning_point", "resolution", "transition"}
+    continuations = {"starts_here", "continues_from_previous_shot", "new_development", "turning_point", "resolves_here"}
+    for index, event in enumerate(payload.get("visual_events", []), start=1):
+        if not isinstance(event, dict):
+            continue
+        event_phase = event.get("event_phase")
+        if event_phase is not None and event_phase not in phases:
+            LOGGER.warning("visual_events[%d].event_phase %r is not a standard value; accepted as-is", index, event_phase)
+        continuation = event.get("continuation")
+        if continuation is not None and continuation not in continuations:
+            LOGGER.warning("visual_events[%d].continuation %r is not a standard value; accepted as-is", index, continuation)
+
+
+def normalize_shot_description(payload: dict) -> dict:
+    """Make person IDs and dialogue tags visible in the prose field too."""
+    caption = payload.get("shot_caption")
+    if not isinstance(caption, dict):
+        caption = {}
+        payload["shot_caption"] = caption
+
+    def flatten_dialogue_tags(text: str) -> str:
+        previous = None
+        while previous != text:
+            previous = text
+            text = re.sub(r"<d>(\[[^\]]+\])<d>(\[[^\]]+\])", r"<d>\1", text)
+            text = re.sub(r"</d></d>", "</d>", text)
+        return text
+
+    def normalize_unknown_id(value) -> str:
+        value = str(value)
+        lowered = value.lower().replace("-", "_")
+        if "unknown" in lowered:
+            return "unknown"
+        if "new_subject_candidate" in lowered:
+            return "new_subject_candidate"
+        return value
+
+    for subject in payload.get("subjects", []):
+        if isinstance(subject, dict) and subject.get("id") is not None:
+            subject["id"] = normalize_unknown_id(subject["id"])
+    for event in payload.get("visual_events", []):
+        if isinstance(event, dict) and isinstance(event.get("subject_ids"), list):
+            event["subject_ids"] = [normalize_unknown_id(value) for value in event["subject_ids"]]
+    for dialogue in payload.get("dialogue", []):
+        if isinstance(dialogue, dict) and dialogue.get("speaker_id") is not None:
+            dialogue["speaker_id"] = normalize_unknown_id(dialogue["speaker_id"])
+
+    description = caption.get("shot_description") or caption.get("integrated_multimodal_description") or ""
+    if not isinstance(description, str):
+        description = str(description)
+    description = flatten_dialogue_tags(description.strip())
+
+    subject_labels = []
+    for subject in payload.get("subjects", []):
+        if not isinstance(subject, dict) or not subject.get("id"):
+            continue
+        subject_id = str(subject["id"])
+        if subject_id.startswith("S") and subject_id not in description:
+            subject_labels.append(f"{subject.get('description', 'the person')} ({subject_id})")
+    if subject_labels:
+        description = f"{description} Identified subject(s): {'; '.join(subject_labels)}.".strip()
+
+    for dialogue in payload.get("dialogue", []):
+        if not isinstance(dialogue, dict) or not dialogue.get("text"):
+            continue
+        language = str(dialogue.get("language") or "unknown").strip()
+        text = str(dialogue["text"]).strip()
+        tag = f"<d>[{language}]{text}</d>"
+        if tag in description:
+            continue
+        if text in description:
+            description = description.replace(text, tag, 1)
+        else:
+            description = f"{description} {tag}".strip()
+
+    caption.pop("integrated_multimodal_description", None)
+    caption["shot_description"] = description
+    return payload
+
+
+# ---------------------------------------------------------------------------
+# Async annotation
+# ---------------------------------------------------------------------------
+async def annotate_one(
+    client, semaphore: asyncio.Semaphore, record: dict, prompt: str,
+    args: argparse.Namespace, global_context: dict | None = None,
+) -> dict:
+    clip_path = Path(record["clip_path"])
+    shot_id = int(record["shot_id"])
+    context = (
+        f"\nThis is shot {shot_id}. Its absolute source-video time range is "
+        f"{record.get('time_range_sec')}. Annotate only this clip.\n"
+    )
+    if global_context:
+        context += (
+            "\nGLOBAL PERSON CONTEXT (use these stable S IDs; do not create a new ID for a matching person):\n"
+            + json.dumps(global_context, ensure_ascii=False, indent=2)
+            + "\n"
+        )
+    request_prompt = prompt.rstrip() + context
+    formats = [args.request_format] if args.request_format != "auto" else ["video_url", "input_video"]
+    last_error = ""
+    last_response = ""
+    started = time.perf_counter()
+    async with semaphore:
+        encoded = await asyncio.to_thread(encode_video_b64, clip_path)
+        for current_format in formats:
+            try:
+                extra_body = {"chat_template_kwargs": {"enable_thinking": args.thinking}} if args.thinking else {}
+                response = await asyncio.wait_for(
+                    client.chat.completions.create(
+                        model=args.model,
+                        messages=[{"role": "user", "content": build_video_content(request_prompt, encoded, current_format)}],
+                        temperature=args.temperature,
+                        max_tokens=args.max_completion_tokens,
+                        extra_body=extra_body,
+                    ),
+                    timeout=args.timeout,
+                )
+                last_response = extract_text(response)
+                parsed, parse_error = parse_json_response(last_response)
+                if parse_error is None and parsed is not None:
+                    validate_shot_subject_ids(parsed, global_context)
+                    parsed = normalize_shot_description(parsed)
+                    return {
+                        **record,
+                        "success": True,
+                        "model": args.model,
+                        "request_format": current_format,
+                        "global_subject_ids": sorted(
+                            str(item.get("subject_id"))
+                            for item in (global_context or {}).get("subject_registry", [])
+                            if isinstance(item, dict) and item.get("subject_id")
+                        ),
+                        "shot_caption": parsed,
+                        "response_seconds": round(time.perf_counter() - started, 3),
+                    }
+                last_error = parse_error or "invalid response"
+            except Exception as exc:  # noqa: BLE001
+                last_error = f"{current_format}: {type(exc).__name__}: {exc}"
+    return {
+        **record,
+        "success": False,
+        "model": args.model,
+        "error": last_error,
+        "response_text": last_response or None,
+        "response_seconds": round(time.perf_counter() - started, 3),
+    }
+
+
+async def annotate_manifest(manifest: Path, args: argparse.Namespace, client, global_subjects: dict[int, dict]) -> dict:
+    records = load_records(manifest)
+    output_dir = args.output_dir if getattr(args, "flat", False) else args.output_dir / manifest.parent.name
+    individual_dir = output_dir / "shot_captions"
+    raw_dir = output_dir / "raw_responses"
+    individual_dir.mkdir(parents=True, exist_ok=True)
+    raw_dir.mkdir(parents=True, exist_ok=True)
+    prompt = Path(args.prompt_file).read_text(encoding="utf-8")
+    semaphore = asyncio.Semaphore(args.concurrency)
+    jsonl_path = output_dir / "shot_captions.jsonl"
+
+    all_results: dict[int, dict] = {}
+    if args.skip_existing:
+        for record in records:
+            output_path = individual_dir / f"shot_{int(record['shot_id']):05d}.json"
+            if output_path.is_file():
+                try:
+                    existing = json.loads(output_path.read_text(encoding="utf-8"))
+                    if isinstance(existing, dict) and existing.get("success") is True:
+                        all_results[int(record["shot_id"])] = existing
+                except json.JSONDecodeError:
+                    pass
+
+    rounds = max(1, args.retries)
+    base_temperature = args.temperature
+    for round_no in range(1, rounds + 1):
+        args.temperature = min(1.0, base_temperature + 0.2 * (round_no - 1))
+        pending = [r for r in records if all_results.get(int(r["shot_id"]), {}).get("success") is not True]
+        if pending:
+            tasks = [
+                asyncio.create_task(
+                    annotate_one(client, semaphore, record, prompt, args, global_subjects.get(int(record["shot_id"])))
+                )
+                for record in pending
+            ]
+            progress_bar = None
+            if args.progress:
+                try:
+                    from tqdm import tqdm
+                    progress_bar = tqdm(
+                        total=len(tasks),
+                        desc=f"Shot caption {manifest.parent.name} (round {round_no}/{rounds})",
+                        unit="shot",
+                        dynamic_ncols=True,
+                    )
+                except ImportError:
+                    pass
+            success_count = 0
+            failed_count = 0
+            for task in asyncio.as_completed(tasks):
+                result = await task
+                shot_id = int(result["shot_id"])
+                all_results[shot_id] = result
+                persist_item(individual_dir, raw_dir, "shot", shot_id, result, result.get("response_text"))
+                if result.get("success"):
+                    success_count += 1
+                else:
+                    failed_count += 1
+                if progress_bar is not None:
+                    progress_bar.update(1)
+                    progress_bar.set_postfix(ok=success_count, fail=failed_count, refresh=False)
+                    if args.log_each:
+                        progress_bar.write(
+                            f"[{success_count + failed_count}/{len(tasks)}] "
+                            f"{'ok' if result.get('success') else 'fail'} shot_{shot_id:05d}"
+                        )
+            if progress_bar is not None:
+                progress_bar.close()
+
+        ordered = [all_results[int(record["shot_id"])] for record in records]
+        write_jsonl(jsonl_path, ordered)
+        total_success = sum(1 for result in all_results.values() if result.get("success"))
+        total_failed = len(all_results) - total_success
+        summary = {
+            "shots_manifest": str(manifest),
+            "shot_count": len(records),
+            "success_count": total_success,
+            "failed_count": total_failed,
+            "rounds_used": round_no,
+            "model": args.model,
+            "base_url": args.base_url,
+            "output": str(jsonl_path),
+        }
+        (output_dir / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", encoding="utf-8")
+        LOGGER.info(
+            "%s: round %d/%d: %d/%d shot captions succeeded",
+            manifest.parent.name, round_no, rounds, total_success, len(records),
+        )
+        if not pending or total_failed == 0:
+            break
+        LOGGER.warning("%s: round %d left %d failures, running next round", manifest.parent.name, round_no, total_failed)
+        backoff = min(300.0, 60.0 * (2 ** (round_no - 1)))
+        LOGGER.info("%s: sleeping %.0fs before retry round %d", manifest.parent.name, backoff, round_no + 1)
+        await asyncio.sleep(backoff)
+    return summary
+
+
+async def async_main(args: argparse.Namespace) -> int:
+    try:
+        from openai import AsyncOpenAI
+    except ImportError as exc:
+        raise SystemExit("Missing openai package.") from exc
+    manifests = find_manifests(args.input)
+    if getattr(args, "flat", False) and len(manifests) > 1:
+        raise SystemExit("--flat 只支持单个 manifest 输入")
+    global_subjects = load_global_subject_context(args.global_input)
+    args.output_dir.mkdir(parents=True, exist_ok=True)
+    client = AsyncOpenAI(base_url=args.base_url, api_key=args.api_key, timeout=args.timeout)
+    failed = 0
+    for manifest in manifests:
+        try:
+            summary = await annotate_manifest(manifest, args, client, global_subjects)
+            failed += int(summary["failed_count"] > 0)
+        except Exception:
+            failed += 1
+            LOGGER.exception("Failed to annotate %s", manifest)
+    return 1 if failed else 0
+
+
+def main() -> int:
+    load_dotenv()
+    parser = argparse.ArgumentParser(description="Annotate shot clips with MiMo via an OpenAI-compatible API.")
+    parser.add_argument("--input", required=True, type=Path)
+    parser.add_argument("--global-input", type=Path, default=None,
+                        help="global_captions.jsonl or its output directory.")
+    parser.add_argument("--output-dir", required=True, type=Path)
+    parser.add_argument("--flat", action="store_true",
+                        help="单视频模式：产物直接写入 --output-dir，不再追加 <视频名>/ 子目录")
+    parser.add_argument("--prompt-file", type=Path, default=default_prompt_path("shot"))
+    parser.add_argument("--base-url", default=resolve_base_url())
+    parser.add_argument("--api-key", default=resolve_api_key())
+    parser.add_argument("--model", default=resolve_model())
+    parser.add_argument("--request-format", choices=["auto", "video_url", "input_video"], default="video_url")
+    parser.add_argument("--concurrency", type=int, default=4)
+    parser.add_argument("--timeout", type=float, default=1200.0)
+    parser.add_argument("--max-api-seconds", type=float, default=None)
+    parser.add_argument("--retries", type=int, default=3)
+    parser.add_argument("--max-completion-tokens", type=int, default=2048)
+    parser.add_argument("--temperature", type=float, default=0.2)
+    parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=False)
+    parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--log-each", action="store_true")
+    parser.add_argument("--skip-existing", action="store_true")
+    parser.add_argument("--log-level", choices=["DEBUG", "INFO", "WARNING"], default="INFO")
+    args = parser.parse_args()
+    if args.concurrency < 1 or args.retries < 1:
+        parser.error("--concurrency and --retries must be positive")
+    if args.max_api_seconds is not None:
+        if args.max_api_seconds <= 0:
+            parser.error("--max-api-seconds must be positive")
+        args.timeout = min(args.timeout, args.max_api_seconds)
+    logging.basicConfig(level=getattr(logging, args.log_level), format="%(levelname)s %(message)s")
+    for logger_name in ("httpx", "httpcore", "openai"):
+        logging.getLogger(logger_name).setLevel(logging.WARNING)
+        logging.getLogger(logger_name).disabled = True
+    return asyncio.run(async_main(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
