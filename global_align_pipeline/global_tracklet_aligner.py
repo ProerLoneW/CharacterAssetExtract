@@ -42,11 +42,11 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Sequence
 
 _EFP_ROOT = Path(__file__).resolve().parents[1]
-if str(_EFP_ROOT) not in _sys.path:
-    _sys.path.insert(0, str(_EFP_ROOT))
+if str(_EFP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EFP_ROOT))
 _VP_DIR = _EFP_ROOT / "assets" / "visual_person"
-if str(_VP_DIR) not in _sys.path:
-    _sys.path.insert(0, str(_VP_DIR))
+if str(_VP_DIR) not in sys.path:
+    sys.path.insert(0, str(_VP_DIR))
 
 from mimo_caption_client import (  # noqa: E402
     build_video_content,
@@ -192,8 +192,12 @@ def stitch_global_overlay(item: GlobalInput, output_dir: Path, ffmpeg: str,
         "".join(f"file '{path.as_posix()}'\n" for path in item.overlays),
         encoding="utf-8")
     if reencode:
+        # Downscale to 720p + lower CRF keeps the overlay text legible while
+        # dropping the stitched video's base64 footprint under the model's
+        # 220k-token context cap when the global clip has many shots.
         cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
-               "-an", "-c:v", "libx264", "-preset", "fast", "-crf", "20",
+               "-an", "-vf", "scale='min(1280,iw)':-2",
+               "-c:v", "libx264", "-preset", "fast", "-crf", "26",
                "-pix_fmt", "yuv420p", str(out_path)]
     else:
         cmd = [ffmpeg, "-y", "-f", "concat", "-safe", "0", "-i", str(list_path),
@@ -211,7 +215,13 @@ def stitch_global_overlay(item: GlobalInput, output_dir: Path, ffmpeg: str,
 # --------------------------------------------------------------------------- #
 
 def global_tracklet_inventory(item: GlobalInput, shot_rows: Dict[int, dict]) -> List[dict]:
-    """Tracklet inventory with global-clip-relative time ranges."""
+    """Tracklet inventory with global-clip-relative time ranges (compact form).
+
+    The full payload (face_gallery, body_gallery, quality dict, cannot_links
+    arrays) blows past the model's 220k token budget once every tracklet of a
+    global clip is enumerated. We keep only the discriminative evidence the
+    model needs to assign each tracklet to an S-ID.
+    """
     inventory: List[dict] = []
     global_start = float(item.time_range_sec[0])
     for dir_name in item.shot_dir_names:
@@ -225,6 +235,9 @@ def global_tracklet_inventory(item: GlobalInput, shot_rows: Dict[int, dict]) -> 
                            key=lambda v: float(v.get("quality_score", 0.0)), reverse=True)
             bodies = sorted(tracklet.get("body_gallery", []),
                             key=lambda v: float(v.get("quality_score", 0.0)), reverse=True)
+            best_face_q = round(float(faces[0].get("quality_score", 0.0)), 3) if faces else None
+            best_body_q = round(float(bodies[0].get("quality_score", 0.0)), 3) if bodies else None
+            cannot_links = tracklet.get("cannot_links", []) or []
             inventory.append({
                 "tracklet_id": str(tracklet.get("tracklet_id")),
                 "shot_id": str(tracklet.get("shot_id", dir_name)),
@@ -234,22 +247,46 @@ def global_tracklet_inventory(item: GlobalInput, shot_rows: Dict[int, dict]) -> 
                 ],
                 "observation_count": len(tracklet.get("observation_ids", [])),
                 "face_evidence_count": len(faces),
-                "best_face": ({key: faces[0].get(key) for key in
-                               ("observation_id", "frame_index", "det_score", "quality_score")}
-                              if faces else None),
                 "body_evidence_count": len(bodies),
-                "best_body": ({key: bodies[0].get(key) for key in
-                               ("observation_id", "frame_index", "grounding_score", "quality_score")}
-                              if bodies else None),
-                "cannot_links": list(tracklet.get("cannot_links", [])),
-                "track_quality": tracklet.get("quality", {}),
+                "best_face_quality": best_face_q,
+                "best_body_quality": best_body_q,
+                "cannot_links_count": len(cannot_links),
             })
     return inventory
 
 
 def build_caption_evidence(item: GlobalInput,
                            caption_context: Dict[str, dict]) -> List[dict]:
-    """Per-shot caption context, ordered, plus the global-level block first."""
+    """Compact per-shot caption context plus a single global block.
+
+    The raw `shot`/`segment` payload includes a subject registry, ASR
+    attribution, scene metadata and rich description. For the global
+    tracklet-alignment pass we keep only the parts the assignment actually
+    needs: short caption text, time range and a compact subject summary.
+    """
+    def _trim(block: Any) -> dict:
+        if not isinstance(block, dict):
+            return {}
+        out = {"time_range_sec": block.get("time_range_sec")}
+        for key in ("caption_text", "description", "global_caption",
+                    "global_description", "compact_caption"):
+            if isinstance(block.get(key), str) and block[key].strip():
+                out["caption_text"] = block[key]
+                break
+        subjects = []
+        for entry in block.get("subject_registry") or block.get("subjects") or []:
+            if not isinstance(entry, dict):
+                continue
+            subjects.append({
+                "subject_id": entry.get("subject_id"),
+                "identity_description": entry.get("identity_description"),
+                "importance_tier": entry.get("importance_tier"),
+                "visual_cues": entry.get("visual_cues"),
+            })
+        if subjects:
+            out["subject_registry"] = subjects
+        return out
+
     evidence: List[dict] = []
     global_block: Optional[dict] = None
     for dir_name in item.shot_dir_names:
@@ -259,10 +296,10 @@ def build_caption_evidence(item: GlobalInput,
             global_block = context["global"]
         evidence.append({
             "shot_number": number,
-            "shot": context.get("shot", {}),
-            "segment": context.get("segment", {}),
+            "shot": _trim(context.get("shot", {})),
+            "segment": _trim(context.get("segment", {})),
         })
-    return [{"global": global_block or {}}, *evidence]
+    return [{"global": _trim(global_block or {})}, *evidence]
 
 
 def build_request_prompt(base_prompt: str, item: GlobalInput, video_path: Path,
@@ -400,6 +437,34 @@ async def align_one(client, semaphore, item: GlobalInput, shot_rows: Dict[int, d
                 "status": "dry_run_no_model_call", "stitched_video": str(video_path),
                 "tracklet_count": len(inventory)}
 
+    if args.skip_model_call:
+        # Emit a deterministic fail-open alignment: every tracklet is bucketed
+        # under a synthetic `new_subject_candidate` so downstream stages have
+        # something to consume even when MiMo is unavailable.
+        rows = []
+        for row in inventory:
+            rows.append({
+                "tracklet_id": row["tracklet_id"],
+                "subject_id": "new_subject_candidate",
+                "importance_tier": "unknown",
+                "confidence": 0.0,
+                "visual_cues": [],
+                "reason": "skip_model_call_fail_open",
+            })
+        return {
+            "schema_version": SCHEMA_VERSION,
+            "global_scope_id": item.scope_id,
+            "global_id": item.global_id,
+            "status": "skip_model_call_fail_open",
+            "stitched_video": f"{item.scope_id}_tracklets.mp4",
+            "tracklet_count": len(inventory),
+            "assigned_tracklet_count": 0,
+            "tracklet_alignments": rows,
+            "missing_alignment_tracklet_ids": [],
+            "unmatched_semantic_subject_ids": [],
+            "quality_issues": [],
+        }
+
     formats = ["video_url", "input_video"]
     attempts: List[dict] = []
     backoff = 0.0
@@ -475,6 +540,11 @@ def _write_json(path: Path, payload: Any) -> None:
 async def run(args: argparse.Namespace) -> int:
     logging.basicConfig(level=logging.INFO,
                         format="%(asctime)s %(levelname)s %(name)s %(message)s")
+    # The httpx INFO level prints the entire request body, which here is the
+    # stitched video's base64 (~10-20 MB) and dominates the log volume.
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+    logging.getLogger("httpcore").setLevel(logging.WARNING)
+    logging.getLogger("httpx2").setLevel(logging.WARNING)
     args.output.mkdir(parents=True, exist_ok=True)
 
     global_inputs = build_global_inputs(args.tracklets, args.global_manifest, args.shots)
@@ -484,13 +554,20 @@ async def run(args: argparse.Namespace) -> int:
                                            args.segment_captions)
     base_prompt = args.prompt_file.read_text(encoding="utf-8")
 
-    from openai import AsyncOpenAI  # deferred: keeps --dry-run usable without it
-    base_url = resolve_base_url(args.base_url)
-    configure_no_proxy_for_url(base_url)
-    client = AsyncOpenAI(base_url=base_url,
-                         api_key=resolve_api_key(args.api_key))
-    semaphore = asyncio.Semaphore(args.concurrency)
-    rate_gate = AsyncRateGate(args.rate_limit)
+    if args.dry_run or args.skip_model_call:
+        # Skip model client entirely; --dry-run only needs stitching + packaging,
+        # and --skip-model-call emits a deterministic fail-open alignment.
+        client = None
+        semaphore = asyncio.Semaphore(args.concurrency)
+        rate_gate = None
+    else:
+        from openai import AsyncOpenAI  # deferred: keep import lazy so --dry-run works without it
+        base_url = resolve_base_url(args.base_url)
+        configure_no_proxy_for_url(base_url)
+        client = AsyncOpenAI(base_url=base_url,
+                             api_key=resolve_api_key(args.api_key))
+        semaphore = asyncio.Semaphore(args.concurrency)
+        rate_gate = AsyncRateGate(args.rate_limit)
 
     results = await asyncio.gather(*[
         align_one(client, semaphore, item, shot_rows, caption_context,
@@ -505,12 +582,14 @@ async def run(args: argparse.Namespace) -> int:
         _write_json(args.output / "alignments" / f"{row.get('global_scope_id')}.json", row)
 
     ok = [row for row in results if row.get("status") == "ok"]
+    skip_open = [row for row in results if row.get("status") == "skip_model_call_fail_open"]
     total = sum(row.get("tracklet_count", 0) for row in ok)
     assigned = sum(row.get("assigned_tracklet_count", 0) for row in ok)
     summary = {
         "schema_version": SCHEMA_VERSION,
         "global_count": len(results),
         "ok_count": len(ok),
+        "skip_open_count": len(skip_open),
         "failed_count": sum(1 for row in results if row.get("status") == "failed"),
         "tracklet_count": total,
         "assigned_tracklet_count": assigned,
@@ -524,7 +603,7 @@ async def run(args: argparse.Namespace) -> int:
     }
     _write_json(args.output / "summary.json", summary)
     LOGGER.info("done: %s", json.dumps(summary["per_global"], ensure_ascii=False))
-    return 0 if ok or args.dry_run else 1
+    return 0 if ok or skip_open or args.dry_run else 1
 
 
 def main() -> None:
@@ -553,6 +632,12 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--dry-run", action="store_true",
                         help="stitch and write request packages without calling MiMo")
+    parser.add_argument("--skip-model-call", action="store_true",
+                        help="emit a fail-open alignment (every tracklet → "
+                             "new_subject_candidate) without invoking MiMo; "
+                             "useful when the upstream model is unreachable "
+                             "but downstream materialisation still needs an "
+                             "alignment file to consume.")
     args = parser.parse_args()
     args.model = resolve_model(args.model)
     args.prompt_file = args.prompt_file.resolve()

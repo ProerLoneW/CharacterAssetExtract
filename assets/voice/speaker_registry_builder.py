@@ -189,14 +189,54 @@ class SpeakerEmbedder:
 
 
 class Transcriber:
-    def __init__(self, model: Path, device: str, compute_type: str):
-        from faster_whisper import WhisperModel
-        self.model = WhisperModel(str(model), device=device, compute_type=compute_type, local_files_only=True)
+    """Xiaomi-CocktailASR-1 backed ASR with a Whisper-compatible output shape.
+
+    The original implementation used ``faster-whisper``. CocktailASR-1 is a
+    target-speaker ASR (it transcribes only the speaker whose voice matches a
+    reference clip), so the public ``__call__`` contract -- a flat list of
+    ``{asr_id, start, end, text, confidence}`` rows over the full audio --
+    is satisfied by the auto-reference mode of the wrapper.  When the caller
+    has an explicit voiceprint (a single-speaker Stage5 turn is a natural
+    source), they can reach into ``CocktailASRTranscriber`` directly via
+    ``transcribe_segments``; the legacy ``__call__`` keeps the signature the
+    voice pipeline already invokes.
+    """
+    def __init__(self, model: Path, device: str, compute_type: str,
+                 ref_audio: Optional[Path] = None,
+                 asr_segments_json: Optional[Path] = None,
+                 asr_merge_gap: float = 0.3,
+                 language: Optional[str] = None) -> None:
+        # ``compute_type`` was the faster-whisper kwarg; map it to torch dtype
+        # so the same flag keeps working: float16 -> float16, float32/int8 ->
+        # bfloat16 (closest available on Ampere+).  Unknown values fall back
+        # to bfloat16.
+        dtype_map = {"float16": "float16", "float32": "float32", "int8": "bfloat16",
+                     "int8_float16": "bfloat16", "bfloat16": "bfloat16"}
+        torch_dtype = dtype_map.get(compute_type, "bfloat16")
+        # Lazy import: importing cocktail_asr triggers nothing GPU-heavy.
+        from cocktail_asr import CocktailASRTranscriber
+        self._impl = CocktailASRTranscriber(
+            model_dir=str(model), device=device, dtype=torch_dtype)
+        self._ref_audio = str(ref_audio) if ref_audio is not None else None
+        self._segments: list[tuple[float, float]] = []
+        if asr_segments_json is not None:
+            raw = json.loads(Path(asr_segments_json).read_text(encoding="utf-8"))
+            rows = raw.get("segments", raw) if isinstance(raw, dict) else raw
+            for row in rows or []:
+                if isinstance(row, dict) and "start" in row and "end" in row:
+                    self._segments.append((float(row["start"]), float(row["end"])))
+                elif isinstance(row, (list, tuple)) and len(row) >= 2:
+                    self._segments.append((float(row[0]), float(row[1])))
+        self._merge_gap = asr_merge_gap
+        self._language = language
     def __call__(self, audio: Path, language: Optional[str]) -> list[dict[str, Any]]:
-        segments, _ = self.model.transcribe(str(audio), language=language, vad_filter=True, word_timestamps=False)
-        return [{"asr_id": f"ASR{i:05d}", "start": round(float(x.start), 3),
-                 "end": round(float(x.end), 3), "text": x.text.strip(),
-                 "confidence": round(float(math.exp(x.avg_logprob)), 6)} for i, x in enumerate(segments, 1)]
+        if self._segments:
+            return self._impl.transcribe_segments(
+                audio, self._segments,
+                ref_audio=self._ref_audio,
+                language=language or self._language,
+                merge_gap=self._merge_gap)
+        return self._impl.transcribe(audio, language=language or self._language)
 
 
 @dataclass
@@ -482,7 +522,7 @@ def run(args: argparse.Namespace) -> dict[str,Any]:
     if args.asr_json:
         asr=_rows(json.loads(Path(args.asr_json).expanduser().read_text(encoding="utf-8")))
     else:
-        asr=[] if args.disable_asr else Transcriber(Path(args.asr_model).expanduser().resolve(),args.device,args.compute_type)(audio_path,args.language)
+        asr=[] if args.disable_asr else Transcriber(Path(args.asr_model).expanduser().resolve(),args.device,args.compute_type,ref_audio=getattr(args, "asr_ref_audio", None),asr_segments_json=getattr(args, "asr_segments_json", None))(audio_path,args.language)
     diar_raw=json.loads(Path(args.diarization_json).read_text(encoding="utf-8")) if args.diarization_json else None
     vad_raw=json.loads(Path(args.vad_json).read_text(encoding="utf-8")) if args.vad_json else None
     diar=_seconds_if_needed(normalize_diarization(diar_raw),timeline["duration"]) if diar_raw is not None else []
@@ -612,7 +652,14 @@ def parser() -> argparse.ArgumentParser:
     p=argparse.ArgumentParser(description="Stage 5 V2 overlap-aware global speaker registry")
     p.add_argument("--input",required=True);p.add_argument("--output",required=True);p.add_argument("--vad-model");p.add_argument("--vad-json")
     p.add_argument("--diarization-model",default="local_models/speaker/campplus_diarization");p.add_argument("--diarization-json")
-    p.add_argument("--embedding-model",default="local_models/speaker/campplus_sv");p.add_argument("--asr-model",default="local_models/faster-whisper-large-v3");p.add_argument("--asr-json",help="Reuse a previously generated Whisper timeline")
+    p.add_argument("--embedding-model",default="local_models/speaker/campplus_sv");p.add_argument("--asr-model",default="local_models/Xiaomi-CocktailASR-1");p.add_argument("--asr-json",help="Reuse a previously generated Whisper timeline")
+    p.add_argument("--asr-ref-audio", type=Path,
+                   help="Optional reference voiceprint (16 kHz mono). When set, CocktailASR-1 "
+                        "transcribes only the speaker whose voice matches this clip.")
+    p.add_argument("--asr-segments-json", type=Path,
+                   help="Optional JSON file with [{start, end}, ...] rows. When provided, "
+                        "CocktailASR-1 transcribes each segment and returns one row per "
+                        "(merged) segment instead of one row over the whole audio.")
     p.add_argument("--disable-asr",action="store_true");p.add_argument("--language");p.add_argument("--device",default="cuda");p.add_argument("--compute-type",default="float16");p.add_argument("--oracle-speakers",type=int)
     p.add_argument("--vad-padding",type=float,default=.5);p.add_argument("--merge-gap-seconds",type=float,default=.4);p.add_argument("--max-window-duration",type=float,default=15.);p.add_argument("--min-overlap-duration",type=float,default=.2)
     p.add_argument("--min-turn-duration",type=float,default=.8);p.add_argument("--max-turn-duration",type=float,default=15.);p.add_argument("--cluster-threshold",type=float,default=.60);p.add_argument("--possible-link-threshold",type=float,default=.50);p.add_argument("--competitor-margin",type=float,default=.05);p.add_argument("--min-support",type=int,default=1);p.add_argument("--gallery-top-k",type=int,default=3);p.add_argument("--voice-top-k",type=int,default=3);p.add_argument("--ground-truth");p.add_argument("--min-reference-duration",type=float,default=2.);p.add_argument("--max-reference-duration",type=float,default=10.)

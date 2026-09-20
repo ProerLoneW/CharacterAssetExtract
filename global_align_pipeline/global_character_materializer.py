@@ -159,13 +159,14 @@ def main() -> None:
     report = []
     assigned_total = 0
     for row in _load_jsonl(args.alignment):
-        if row.get("status") != "ok":
+        status = str(row.get("status") or "")
+        if status not in {"ok", "skip_model_call_fail_open"}:
             continue
         scope_id = str(row["global_scope_id"])
         by_subject: Dict[str, List[dict]] = defaultdict(list)
         for alignment in row.get("tracklet_alignments", []):
             subject_id = str(alignment.get("subject_id"))
-            if subject_id in {"unknown", "new_subject_candidate"}:
+            if subject_id in {"unknown"}:
                 continue
             if float(alignment.get("confidence", 0.0)) < args.min_confidence:
                 continue
