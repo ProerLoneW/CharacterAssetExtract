@@ -25,11 +25,17 @@ mkdir -p "$OUT_WS"
   --concurrency 2
 
 # Step 2: materialise characters/<scope>/<S-ID>/{visual,voice}
+# --identity-check reruns Stage 3's InsightFace pack on the gallery faces and
+# drops face crops of tracklets that do not match the character's face core
+# (e.g. a bystander MiMo absorbed into an S-ID). Fail-open: if the model is
+# unavailable the check is skipped, not fatal.
 "$PY" "$ROOT/global_align_pipeline/global_character_materializer.py" \
   --alignment "$OUT_WS/global_alignment/global_tracklet_alignment.jsonl" \
   --tracklets "$SRC_WS/assets/visual_person_v2/tracklets" \
   --voice-root "$SRC_WS/voice_by_role_src" \
   --output "$OUT_WS" \
-  --face-top-k 8 --body-top-k 8
+  --face-top-k 8 --body-top-k 8 \
+  --identity-check \
+  --face-model "$ROOT/local_models/insightface/models/buffalo_l/w600k_r50.onnx"
 
 echo "done -> $OUT_WS"

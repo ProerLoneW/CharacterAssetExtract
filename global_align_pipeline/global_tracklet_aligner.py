@@ -66,11 +66,12 @@ from semantic_role_tracklet_refiner import (  # noqa: E402
 )
 
 LOGGER = logging.getLogger("global_tracklet_aligner")
-SCHEMA_VERSION = "global-tracklet-character-alignment-v1"
+SCHEMA_VERSION = "global-tracklet-character-alignment-v2"
 HERE = Path(__file__).resolve().parent
 DEFAULT_PROMPT = HERE / "prompts" / "global_tracklet_alignment_prompt_en_v1.md"
 SHOT_NUMBER_PATTERN = re.compile(r"(\d+)$")
 SUBJECT_PATTERN = re.compile(r"S[1-9][0-9]*$")
+ENTITY_NATURES = {"real_person", "depicted_person", "non_person", "uncertain"}
 
 
 # --------------------------------------------------------------------------- #
@@ -357,9 +358,16 @@ def normalize_alignment(payload: dict, item: GlobalInput,
         subject_id = str(raw.get("subject_id") or "unknown")
         if subject_id not in allowed:
             raise ValueError(f"subject_id {subject_id!r} not in allowed set")
+        # entity_nature is fail-open: an invalid or missing value degrades to
+        # "uncertain" (materialized by default downstream) instead of killing
+        # an otherwise valid response.
+        entity_nature = str(raw.get("entity_nature") or "uncertain")
+        if entity_nature not in ENTITY_NATURES:
+            entity_nature = "uncertain"
         by_id[tracklet_id] = {
             "tracklet_id": tracklet_id,
             "subject_id": subject_id,
+            "entity_nature": entity_nature,
             "importance_tier": str(raw.get("importance_tier") or "unknown"),
             "confidence": _confidence(raw.get("confidence")),
             "visual_cues": [str(v) for v in raw.get("visual_cues", [])
@@ -376,6 +384,7 @@ def normalize_alignment(payload: dict, item: GlobalInput,
             by_id[tracklet_id] = {
                 "tracklet_id": tracklet_id,
                 "subject_id": "unknown",
+                "entity_nature": "uncertain",
                 "importance_tier": "unknown",
                 "confidence": 0.0,
                 "visual_cues": [],
@@ -384,6 +393,9 @@ def normalize_alignment(payload: dict, item: GlobalInput,
 
     assigned = sum(1 for row in by_id.values()
                    if row["subject_id"] not in {"unknown", "new_subject_candidate"})
+    nature_counts: Dict[str, int] = {}
+    for row in by_id.values():
+        nature_counts[row["entity_nature"]] = nature_counts.get(row["entity_nature"], 0) + 1
     return {
         "schema_version": SCHEMA_VERSION,
         "global_scope_id": item.scope_id,
@@ -392,6 +404,7 @@ def normalize_alignment(payload: dict, item: GlobalInput,
         "stitched_video": f"{item.scope_id}_tracklets.mp4",
         "tracklet_count": len(inventory),
         "assigned_tracklet_count": assigned,
+        "entity_nature_counts": nature_counts,
         "tracklet_alignments": [by_id[row["tracklet_id"]] for row in inventory],
         "missing_alignment_tracklet_ids": missing,
         "unmatched_semantic_subject_ids": [str(v) for v in
@@ -446,6 +459,7 @@ async def align_one(client, semaphore, item: GlobalInput, shot_rows: Dict[int, d
             rows.append({
                 "tracklet_id": row["tracklet_id"],
                 "subject_id": "new_subject_candidate",
+                "entity_nature": "uncertain",
                 "importance_tier": "unknown",
                 "confidence": 0.0,
                 "visual_cues": [],
@@ -459,6 +473,7 @@ async def align_one(client, semaphore, item: GlobalInput, shot_rows: Dict[int, d
             "stitched_video": f"{item.scope_id}_tracklets.mp4",
             "tracklet_count": len(inventory),
             "assigned_tracklet_count": 0,
+            "entity_nature_counts": {"uncertain": len(rows)},
             "tracklet_alignments": rows,
             "missing_alignment_tracklet_ids": [],
             "unmatched_semantic_subject_ids": [],
@@ -585,6 +600,10 @@ async def run(args: argparse.Namespace) -> int:
     skip_open = [row for row in results if row.get("status") == "skip_model_call_fail_open"]
     total = sum(row.get("tracklet_count", 0) for row in ok)
     assigned = sum(row.get("assigned_tracklet_count", 0) for row in ok)
+    nature_totals: Dict[str, int] = {}
+    for row in ok + skip_open:
+        for nature, count in (row.get("entity_nature_counts") or {}).items():
+            nature_totals[nature] = nature_totals.get(nature, 0) + count
     summary = {
         "schema_version": SCHEMA_VERSION,
         "global_count": len(results),
@@ -594,6 +613,7 @@ async def run(args: argparse.Namespace) -> int:
         "tracklet_count": total,
         "assigned_tracklet_count": assigned,
         "assignment_rate": round(assigned / total, 4) if total else 0.0,
+        "entity_nature_totals": nature_totals,
         "per_global": [{
             "global_scope_id": row.get("global_scope_id"),
             "status": row.get("status"),
