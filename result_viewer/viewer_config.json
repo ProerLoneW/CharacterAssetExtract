@@ -1,0 +1,41 @@
+{
+  "listen_host": "127.0.0.1",
+  "service_port": 8930,
+  "base_path": "",
+  "doc_path": "../docs/02_全流程Pipeline说明.md",
+  "frontend_dist": "./frontend_dist",
+  "allowed_runs": ["movie_full_pipeline_20260912_v4"],
+  "runs": {
+    "movie_full_pipeline_20260912_v4": {
+      "video_id": "1080P",
+      "title": "0912_v4 旧链整合运行(本仓库内样本)",
+      "layout_profile": "custom",
+      "route_id": "legacy-chr",
+      "produced_code_revision": null,
+      "created_at": "2026-09-12",
+      "workspace_root": "../movie_full_pipeline_20260912_v4",
+      "source_roots": [
+        { "root_id": "run_root", "path": "../movie_full_pipeline_20260912_v4" }
+      ],
+      "path_rewrites": [
+        { "pattern": "^.*/movie_full_pipeline_20260912_v4/", "replacement": "{run_root}/" },
+        { "pattern": "^.*/movie_full_pipeline_20260912/segments/(.*)$", "replacement": "{run_root}/segments/$1" },
+        { "pattern": "^.*/movie_full_pipeline_20260912/shots/clips/[^/]*_shot_(\\d+)\\.mp4$", "replacement": "{run_root}/middle/shot_clips/SHOT_$1.mp4" },
+        { "pattern": "^.*/voice_by_role_src/(.*)$", "replacement": "{run_root}/voice_by_role_src/$1" }
+      ],
+      "artifact_bindings": {
+        "shots": { "relative_path": "middle/shots.jsonl", "producer_module_id": "shot_split" },
+        "globals": { "relative_path": "middle/global_clips.jsonl", "producer_module_id": "global_group" },
+        "global_captions": { "relative_path": "captions_speaker/global/global_captions.jsonl", "producer_module_id": "global_describe" },
+        "attributed_asr": { "relative_path": "captions_speaker/global/speaker_attributed_asr.jsonl", "producer_module_id": "global_describe" },
+        "shot_captions": { "relative_path": "captions_speaker/shot/shot_captions.jsonl", "producer_module_id": "shot_describe" },
+        "segment_captions": { "relative_path": "captions_speaker/segment/segment_captions.jsonl", "producer_module_id": "segment_describe" },
+        "segment_media": { "relative_path": "segments/segments.jsonl", "producer_module_id": "segment_export", "source_run_id": "movie_full_pipeline_20260912" },
+        "voice_previews": { "relative_path": "voice_by_role_src/all_asr_manifest.jsonl", "producer_module_id": "voice_preview" },
+        "tracklets": { "relative_path": "assets/visual_person_v2/tracklets", "producer_module_id": "person_tracks" },
+        "role_binding": { "relative_path": "characters/role_alignment.json", "producer_module_id": "legacy_bind" },
+        "legacy_characters": { "relative_path": "characters/characters", "producer_module_id": "legacy_bind" }
+      }
+    }
+  }
+}

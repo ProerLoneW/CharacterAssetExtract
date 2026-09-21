@@ -1,6 +1,6 @@
 # 视频理解与资产提取：全流程 Pipeline 说明
 
-本文件同时服务人类阅读和未来结果网站的内容加载。格式遵循[文档规范](01_系统文档规范与Agent协作.md)，网页实现遵循[网站设计](03_结果展示网站设计.md)。核验日期：2026-09-18。依据为当前源码工作树及实际结果目录；本次未执行模型推理或重跑系统。
+本文件同时服务人类阅读和未来结果网站的内容加载。格式遵循[文档规范](01_系统文档规范与Agent协作.md)，网页实现遵循[网站设计](03_结果展示网站设计.md)。核验日期：2026-09-18；`1.1.0` 重排主线/支线、`1.2.0` 新增主线编排入口、`1.3.0 / 2026-09-21` 展示瘦身（非主线模块移至文末，未删除），均未改变模块事实。依据为当前源码工作树及实际结果目录；本次未执行模型推理或重跑系统。
 
 <!-- section:system-index -->
 ## 系统索引
@@ -9,8 +9,8 @@
 {
   "doc_id": "extract-full-pipeline",
   "schema_version": "1.0.0",
-  "content_version": "1.0.0",
-  "updated_at": "2026-09-18",
+  "content_version": "1.3.0",
+  "updated_at": "2026-09-21",
   "title": "视频理解与资产提取系统",
   "summary": "从视频结构和语义描述出发，形成可追溯的人物、声音、物体、场景资产及生成效果对比。",
   "code_baseline": "0c5ddfd367388461d96bed16fc57e4560a70ace8",
@@ -25,12 +25,10 @@
     {"id":"characters","title":"角色汇总","order":50},
     {"id":"objects","title":"关键物体","order":60},
     {"id":"scenes","title":"场景参考","order":70},
-    {"id":"generation","title":"生成任务与对比","order":80},
-    {"id":"compatibility","title":"兼容与实验支路","order":90},
-    {"id":"service","title":"结果服务","order":100}
+    {"id":"compatibility","title":"支线与扩展模块","order":80}
   ],
   "routes": [
-    {"id":"fixed-global-align","title":"固定分段与全局人物归属","modules":["source_prepare","shot_split","global_group","segment_plan","asr_timeline","global_describe","shot_describe","segment_describe","segment_export","person_tracks","person_align","voice_preview","character_pack","object_queue","object_ground","scene_select","generation_bundle"],"description":"主要讲解路径；各原子步骤组合，不存在包办全部步骤的单一 all 入口。"},
+    {"id":"fixed-global-align","title":"固定分段与全局人物归属","modules":["shot_split","global_group","segment_plan","asr_timeline","global_describe","shot_describe","segment_describe","segment_export","person_tracks","person_align","voice_preview","character_pack","object_queue","object_ground","scene_select"],"description":"主要讲解路径，与 run_full_pipeline.py 的 15 阶段编排一一对应（外部 ASR 为输入）；扩展与支线模块见文末章节。"},
     {"id":"basic-caption","title":"基础三级描述","modules":["source_prepare","shot_split","global_group","global_describe","shot_describe","segment_describe","segment_export"],"description":"mimo_video_pipeline.py 的六步编排；global 不含 Scheme A 的权威 ASR 归属，segment 由模型在边界约束下组织。"},
     {"id":"legacy-chr","title":"CHR 聚类与角色映射","modules":["source_prepare","shot_split","global_group","segment_plan","asr_timeline","global_describe","shot_describe","segment_describe","person_tracks","legacy_refine","legacy_identity","legacy_gallery","voice_model","voice_preview","legacy_bind"],"description":"保留逐镜头语义筛选、跨镜头身份图、CHR 画廊、投票绑定，用于兼容和对照。"},
     {"id":"audio-evidence","title":"前景声音与身份验证","modules":["source_prepare","shot_split","global_group","voice_model"],"description":"可独立运行；得到 SPK 身份和净语音证据，不自动得到视觉 S-ID。"}
@@ -54,25 +52,23 @@
 系统需要回答三类问题：视频发生了什么；画面中的人、物体、场景分别是什么；这些内容能否转化为可浏览、可复用、可追溯的素材。它先建立时间结构，再建立语义身份，最后把语义判断落实到图片、掩码、音频和视频文件。
 
 ```text
-源视频 → 可选预处理 → 镜头清单 → 全局片段
-                         │          ├→ 固定 segment 计划（Scheme A 上游）
-                         │          ├→ 外部 ASR → 全局描述与说话归属
-                         │          │                 ↓
-                         ├──────────┴──────────→ 镜头描述 → 片段描述 → 片段视频
+源视频 → 镜头清单 → 全局片段（60–120 秒）
+                         │           ├→ 固定 segment 计划
+                         │           └→ 外部 ASR → 全局描述与说话归属
+                         │                            ↓
+                         ├──────────────────────────→ 镜头描述 → 片段描述 → 片段视频
                          │
-                         ├→ 多帧人物轨迹 ──┬→ 全局直接归属 ──────────┐
-                         │                 └→ 逐镜头语义筛选         │
-                         │                     → CHR 聚类 → 画廊 → 投票绑定（兼容）
-                         │                                         │
-全局 ASR 归属 → 候选音频预览 ───────────────────────────────→ 角色目录
-全局视频 → 前景分离/重叠检测/说话人建模 → 净语音与审核证据（增强支路）
-镜头描述 → 关键物体候选 → 定位与分割 → 物体参考集
-全局视频 → 场景聚类与选帧 → 场景参考图
-片段描述 + 场景/物体参考 + 角色关联 → I2I 任务包 → 外部生成与效果对比
+                         ├→ 多帧人物轨迹 → 轨迹全局归属到 S-ID ──┐
+全局 ASR 归属 → 候选音频预览 ────────────────────────────→ 角色目录（裁图 + 候选声音）
+                         │
+                         ├→ 镜头描述 → 关键物体候选 → 定位与分割 → 物体参考集
+                         └→ 全局视频 → 场景聚类与选帧 → 场景参考图
 所有产物 + 本文档 → 只读结果网站
+
+（不在上图中展开：可选预处理、I2I 生成对比等扩展模块，以及旧 CHR 人物链、声音增强建模与兼容支路，见文末“支线、扩展与外部模块”。）
 ```
 
-人物新旧链是替代/对照关系；新链不必先经过 CHR 聚类。场景提取不依赖字幕或人物身份，可与语义链并行。声音增强链不依赖视觉人物归属；需要证据连接才能把 SPK 与 S-ID 关联。
+主线只讲上图：先建时间结构与语义身份，再把语义判断落实为人物、声音、物体、场景资产；这与 run_full_pipeline.py 的 15 阶段编排一一对应（外部 ASR 为输入）。场景提取不依赖字幕或人物身份，可与语义链并行。其余模块移至文末“支线、扩展与外部模块”：可选预处理与 I2I 生成对比属于扩展；旧 CHR 人物链与轨迹直接归属的新链是替代/对照关系，不是必经步骤；声音增强链不依赖视觉人物归属，需要证据连接才能把 SPK 与 S-ID 关联。
 
 ### 身份和时间：所有页面共用的基础
 
@@ -118,54 +114,12 @@ movie_full_pipeline_20260916/
 样本核验结果：3 个 global、59 个 shot、12 个导出 segment；190 条轨迹中 91 条归属 S-ID、99 条 unknown；物化 16 个 `(scope,S-ID)` 角色目录；ASR 预览 72 条，其中候选 58、非候选 14；物体候选 25 个、观测 125 行，其中 67 行 `ambiguous_instance=true`，虽然这 125 行 `status` 都是 `ok`。这些数是静态样本快照，不是准确率，不是全片统计，也不能硬编码为网页 KPI。
 <!-- /section:overview -->
 
-<!-- module:source_prepare -->
-## 01 · 输入与预处理
-
-```json pipeline-module
-{
-  "id":"source_prepare","title":"输入与预处理","order":10,"group":"structure","lifecycle":"optional","implementation":"existing",
-  "summary":"确认源视频及时间坐标，按需移除片头片尾低内容区间。",
-  "depends_on":[],"optional_depends_on":[],"inputs":[],
-  "source_refs":["preprocessing/preprocess.py"],"evidence":["code"],
-  "outputs":[
-    {"id":"source_video","title":"切镜输入视频","kind":"media","paths":{"custom":["{source_video}"]},"record_key":[],"timebase":"source","schema":"unversioned","required":true},
-    {"id":"preprocess_info","title":"预处理区间报告","kind":"json","paths":{"custom":["{output}/processed_info.json"]},"record_key":[],"timebase":"source","schema":"unversioned","required":false}
-  ],
-  "view":{"enabled":true,"renderer":"source-overview","adapter":"source-v1","filters":[],"primary_artifact":"source_video"}
-}
-```
-
-### 作用与判断
-
-输入登记是概念上的必需步骤，执行裁剪是可选动作。`preprocessing/preprocess.py` 用低亮度、低音量和相邻采样帧平均亮度变化判断候选丢弃区间；它不是语义片头/字幕识别器，静态剧情也可能被命中。
-
-### 输入与前置条件
-
-输入本地视频，依赖 ffmpeg/ffprobe、numpy。先确认视频/音轨可读取，以及后续究竟使用原片还是处理后视频。当前两套 caption 编排的 `all` 都不会自动执行这里。
-
-### 处理过程
-
-默认 2 fps 稀疏采样、亮度阈值 8、静态变化阈值 1.5、音量 RMS 阈值 0.005；只接受前 180 秒、后 240 秒范围内的候选区间，合并相邻 drop，求保留区间，再切割拼接。实际 CLI 默认值优先于旧 docstring 示例。保留区间可以不止一个。
-
-### 产物与消费
-
-`processed_info.json` 记录 `source/duration_sec/trimmed_sec/kept_intervals/drops/processed_video`；处理视频路径以 `processed_video` 为准。没有裁剪时可直接引用原片。`source_video` 被切镜模块消费；区间报告用于原片与处理后时间互译及网页解释。
-
-### 异常、重跑与成本
-
-这是 CPU 解码与 I/O 工作；stream-copy 切割不应被描述为逐帧精确剪辑。无音轨等输入异常需要预检。改变预处理会改变后续全部 source 时间和切片，不可继续无条件复用旧描述/资产。
-
-### 展示与验收
-
-展示源片信息、处理前后时长和丢弃时间条；可点击看丢弃区间。未执行显示“使用原片”，不显示失败。验收时间映射、保留区间有序不重叠和输出可读。
-<!-- /module:source_prepare -->
-
 <!-- module:shot_split -->
-## 02 · 镜头切分
+## 01 · 镜头切分
 
 ```json pipeline-module
 {
-  "id":"shot_split","title":"镜头切分","order":20,"group":"structure","lifecycle":"active","implementation":"existing",
+  "id":"shot_split","title":"镜头切分","order":10,"group":"structure","lifecycle":"active","implementation":"existing",
   "summary":"将视频变为覆盖时间轴的镜头清单和独立镜头视频。",
   "depends_on":["source_prepare"],"optional_depends_on":[],"inputs":["source_video"],
   "source_refs":["shot_splitter.py","m02_shots/teleai_src/teleai_cut_only.py","m02_shots/run_teleai_pipeline.sh"],"evidence":["code","sample"],
@@ -203,11 +157,11 @@ movie_full_pipeline_20260916/
 <!-- /module:shot_split -->
 
 <!-- module:global_group -->
-## 03 · 全局片段聚合
+## 02 · 全局片段聚合
 
 ```json pipeline-module
 {
-  "id":"global_group","title":"全局片段聚合","order":30,"group":"structure","lifecycle":"active","implementation":"existing",
+  "id":"global_group","title":"全局片段聚合","order":20,"group":"structure","lifecycle":"active","implementation":"existing",
   "summary":"把相邻镜头组织为模型可理解的较长上下文片段。",
   "depends_on":["shot_split"],"optional_depends_on":[],"inputs":["shots"],
   "source_refs":["global_clip_aggregator.py"],"evidence":["code","sample"],
@@ -245,11 +199,11 @@ SCRL 提特征与重编码影响成本。基础编排同样可能仅因清单存
 <!-- /module:global_group -->
 
 <!-- module:segment_plan -->
-## 04 · 固定片段规划
+## 03 · 固定片段规划
 
 ```json pipeline-module
 {
-  "id":"segment_plan","title":"固定片段规划","order":40,"group":"structure","lifecycle":"optional","implementation":"existing",
+  "id":"segment_plan","title":"固定片段规划","order":30,"group":"structure","lifecycle":"optional","implementation":"existing",
   "summary":"在 Scheme A 中由上游决定 segment 边界，模型只补充内容。",
   "depends_on":["shot_split","global_group"],"optional_depends_on":[],"inputs":["shots","globals"],
   "source_refs":["segmentation/three_way.py","m07_segment/window.py","mimo_segment_captioner_fixed_segments_v4.py"],"evidence":["code","sample"],
@@ -284,11 +238,11 @@ window 按长度贪心；v1 按 shot bucket 累加；v2 近似复用边界枚举
 <!-- /module:segment_plan -->
 
 <!-- module:asr_timeline -->
-## 05 · 语音时间轴输入
+## 04 · 语音时间轴输入
 
 ```json pipeline-module
 {
-  "id":"asr_timeline","title":"语音时间轴输入","order":50,"group":"semantics","lifecycle":"external","implementation":"external",
+  "id":"asr_timeline","title":"语音时间轴输入","order":40,"group":"semantics","lifecycle":"external","implementation":"external",
   "summary":"为 Scheme A 提供不可由描述模型随意改写的 ASR 文本与时间。",
   "depends_on":["global_group"],"optional_depends_on":["voice_model"],"inputs":["globals","speaker_registry"],
   "source_refs":["mimo_segment_captioner.py","mimo_global_captioner_speaker_v2.py","assets/voice/cocktail_asr.py"],"evidence":["code","sample"],
@@ -323,11 +277,11 @@ ASR 负责“什么时候说了什么”，global 描述再判断“谁说的”
 <!-- /module:asr_timeline -->
 
 <!-- module:global_describe -->
-## 06 · 全局描述与说话归属
+## 05 · 全局描述与说话归属
 
 ```json pipeline-module
 {
-  "id":"global_describe","title":"全局描述与说话归属","order":60,"group":"semantics","lifecycle":"active","implementation":"existing",
+  "id":"global_describe","title":"全局描述与说话归属","order":50,"group":"semantics","lifecycle":"active","implementation":"existing",
   "summary":"在一个 global 内建立人物注册表、事件时间轴，并按所选路线关联权威对白。",
   "depends_on":["global_group"],"optional_depends_on":["asr_timeline"],"inputs":["globals","authoritative_asr"],
   "source_refs":["mimo_global_captioner.py","mimo_global_captioner_speaker_v2.py","mimo_caption_client.py","prompts/global_caption_prompt_en_semantic_roles_speakers_v4.md"],"evidence":["code","sample"],
@@ -367,11 +321,11 @@ MiMo 调用耗时与视频体积、并发、token 上限有关。基础编排 gl
 <!-- /module:global_describe -->
 
 <!-- module:shot_describe -->
-## 07 · 镜头描述
+## 06 · 镜头描述
 
 ```json pipeline-module
 {
-  "id":"shot_describe","title":"镜头描述","order":70,"group":"semantics","lifecycle":"active","implementation":"existing",
+  "id":"shot_describe","title":"镜头描述","order":60,"group":"semantics","lifecycle":"active","implementation":"existing",
   "summary":"沿用全局人物身份，描述镜头中的动作、画面、声音和关键物体。",
   "depends_on":["shot_split","global_describe"],"optional_depends_on":[],"inputs":["shots","global_captions"],
   "source_refs":["mimo_shot_captioner.py","mimo_shot_captioner_v2.py","mimo_shot_captioner_v3.py","mimo_video_pipeline_scheme_a.py","prompts/shot_caption_prompt_en_semantic_roles_objects_v5.md"],"evidence":["code","sample"],
@@ -406,11 +360,11 @@ MiMo 调用耗时与视频体积、并发、token 上限有关。基础编排 gl
 <!-- /module:shot_describe -->
 
 <!-- module:segment_describe -->
-## 08 · 片段描述
+## 07 · 片段描述
 
 ```json pipeline-module
 {
-  "id":"segment_describe","title":"片段描述","order":80,"group":"semantics","lifecycle":"active","implementation":"existing",
+  "id":"segment_describe","title":"片段描述","order":70,"group":"semantics","lifecycle":"active","implementation":"existing",
   "summary":"把多个镜头组织为可理解的片段描述，并保持人物、对白与物体来源可追溯。",
   "depends_on":["global_describe","shot_describe"],"optional_depends_on":["segment_plan","asr_timeline"],"inputs":["global_captions","shot_captions","segment_plan","authoritative_asr"],
   "source_refs":["mimo_segment_captioner.py","mimo_segment_captioner_v2.py","mimo_segment_captioner_global_speaker_v3.py","mimo_segment_captioner_fixed_segments_v4.py","segment_captioner_legacy/segment_captioner.py"],"evidence":["code","sample"],
@@ -449,11 +403,11 @@ fixed_v4：投影并冻结上游区间和 shot_ids；要求模型返回的 upstr
 <!-- /module:segment_describe -->
 
 <!-- module:segment_export -->
-## 09 · 片段视频导出
+## 08 · 片段视频导出
 
 ```json pipeline-module
 {
-  "id":"segment_export","title":"片段视频导出","order":90,"group":"structure","lifecycle":"active","implementation":"existing",
+  "id":"segment_export","title":"片段视频导出","order":80,"group":"structure","lifecycle":"active","implementation":"existing",
   "summary":"根据已确认的片段区间切出视频，建立描述与媒体的对应关系。",
   "depends_on":["segment_describe"],"optional_depends_on":["global_group"],"inputs":["segment_captions","globals"],
   "source_refs":["mimo_segment_cutter.py"],"evidence":["code","sample"],
@@ -488,11 +442,11 @@ fixed_v4：投影并冻结上游区间和 shot_ids；要求模型返回的 upstr
 <!-- /module:segment_export -->
 
 <!-- module:person_tracks -->
-## 10 · 人物轨迹提取
+## 09 · 人物轨迹提取
 
 ```json pipeline-module
 {
-  "id":"person_tracks","title":"人物轨迹提取","order":100,"group":"people","lifecycle":"active","implementation":"existing",
+  "id":"person_tracks","title":"人物轨迹提取","order":90,"group":"people","lifecycle":"active","implementation":"existing",
   "summary":"把镜头中多帧出现的人物连接为轨迹，并保存可复核的脸部、身体与掩码证据。",
   "depends_on":["shot_split"],"optional_depends_on":[],"inputs":["shots","shot_media"],
   "source_refs":["assets/visual_person/entity_asset_extractor.py","assets/visual_person/shot_tracklet_initializer.py","assets/visual_person/shot_tracklet_builder.py"],"evidence":["code","sample"],
@@ -531,11 +485,11 @@ fixed_v4：投影并冻结上游区间和 shot_ids；要求模型返回的 upstr
 <!-- /module:person_tracks -->
 
 <!-- module:person_align -->
-## 11 · 人物轨迹归属
+## 10 · 人物轨迹归属
 
 ```json pipeline-module
 {
-  "id":"person_align","title":"人物轨迹归属","order":110,"group":"people","lifecycle":"active","implementation":"existing",
+  "id":"person_align","title":"人物轨迹归属","order":100,"group":"people","lifecycle":"active","implementation":"existing",
   "summary":"结合整段带框视频与语义上下文，把每条轨迹直接归属到 global 内的角色。",
   "depends_on":["person_tracks","global_group","global_describe","shot_describe"],"optional_depends_on":["segment_describe"],"inputs":["tracklets","globals","global_captions","shot_captions","segment_captions"],
   "source_refs":["global_align_pipeline/global_tracklet_aligner.py","global_align_pipeline/prompts/global_tracklet_alignment_prompt_en_v1.md","global_align_pipeline/run_global_align_pipeline.sh"],"evidence":["code","sample"],
@@ -576,172 +530,12 @@ fixed_v4：投影并冻结上游区间和 shot_ids；要求模型返回的 upstr
 主指标分开显示已归属/未知/新主体候选/模型未运行；逐角色可看轨迹证据和原因。样本 91/190 是归属覆盖率 47.89%，不是准确率。验收每条轨迹恰好一项归属，scope 正确，降级运行有显著标记。
 <!-- /module:person_align -->
 
-<!-- module:legacy_refine -->
-## 12 · 逐镜头人物语义筛选
-
-```json pipeline-module
-{
-  "id":"legacy_refine","title":"逐镜头人物语义筛选","order":120,"group":"people","lifecycle":"legacy","implementation":"existing",
-  "summary":"为旧 CHR 链给轨迹附加 S-ID、叙事重要性与筛选策略。",
-  "depends_on":["person_tracks","global_describe"],"optional_depends_on":["shot_describe","segment_describe"],"inputs":["tracklets","global_captions","shot_captions","segment_captions"],
-  "source_refs":["assets/visual_person/semantic_role_tracklet_refiner.py","assets/visual_person/semantic_role_tracklet_refiner_v2.py","assets/visual_person/semantic_role_tracklet_refiner_v3.py"],"evidence":["code","sample"],
-  "outputs":[{"id":"semantic_tracklet_views","title":"语义筛选与策略视图","kind":"directory","paths":{"custom":["{output}"]},"record_key":["shot_id","tracklet_id"],"timebase":"shot_local","schema":"mixed","required":true}],
-  "view":{"enabled":true,"renderer":"alignment-evidence","adapter":"semantic-tracklets-v3","filters":["scope","shot","variant","status"],"primary_artifact":"semantic_tracklet_views"}
-}
-```
-
-### 作用与判断
-
-对每个 shot 让 MiMo 对齐语义角色，输出 keep_primary/keep_supporting/keep_context/reject/review 等决策；只在旧链中作为身份聚类的上游筛选，不是新全局链的必经步骤。
-
-### 输入与前置条件
-
-读取 tracklet 签名和 caption 上下文，保留原始轨迹证据；选择 primary、narrative 或 safe 策略时必须记录具体策略。
-
-### 处理过程
-
-打包镜头与轨迹 → 模型判断 → 校验角色集合/重要性/拒绝置信度 → 低证据拒绝改为 review → 输出不同保留视图。safe 是仅排除高置信背景/非人物的保守视图；primary 会显著减少进入下一步的轨迹。V2 增加物体提案，V3 保留其可见时间窗到 grounding 候选。
-
-### 产物与消费
-
-`alignment_results.jsonl`、`alignments/<SHOT>.json`、`semantic_tracklet_index.json`、`manifest.json`；`stage3_inputs/{primary,narrative,safe}/shots/<SHOT>/tracklet_signatures.json` 和 `semantic_identity_decisions.json`；V2/V3 另有 `object_proposals.jsonl/object_grounding_candidates.jsonl`。消费方为 legacy_identity；物体提案可以作为另一路 grounding 来源，必须标注与直接 shot queue 的区别。
-
-### 异常、重跑与成本
-
-此处按 shot 调用 VLM，成本随镜头数增加。失败保守保留不等于身份已确认。改变策略要单独重建其后 CHR 结果；不能混用 primary registry 和 narrative gallery。
-
-### 展示与验收
-
-展示输入轨迹数、各策略保留数和拒绝原因，支持看被过滤轨迹。验收每个视图的来源/策略一致，筛除数可解释。
-<!-- /module:legacy_refine -->
-
-<!-- module:legacy_identity -->
-## 13 · 跨镜头身份聚类
-
-```json pipeline-module
-{
-  "id":"legacy_identity","title":"跨镜头身份聚类","order":130,"group":"people","lifecycle":"legacy","implementation":"existing",
-  "summary":"使用脸部和身体证据构建可追溯的视觉身份图，保留不确定候选。",
-  "depends_on":["legacy_refine"],"optional_depends_on":[],"inputs":["semantic_tracklet_views"],
-  "source_refs":["assets/visual_person/visual_character_registry_builder.py"],"evidence":["code","sample"],
-  "outputs":[{"id":"visual_identity","title":"视觉身份图与 CHR 注册表","kind":"directory","paths":{"custom":["{identity}"]},"record_key":["character_id"],"timebase":"mixed","schema":"cross-shot-identity-v2","required":true}],
-  "view":{"enabled":true,"renderer":"identity-graph","adapter":"visual-identity-v2","filters":["scope","status"],"primary_artifact":"visual_identity"}
-}
-```
-
-### 作用与判断
-
-把多个 shot 的轨迹聚为视觉身份 CHR。脸部证据优先，身体辅助；MUST_LINK、POSSIBLE_LINK、CANNOT_LINK 是不同证据等级，不是全部直接并入同一人。
-
-### 输入与前置条件
-
-选定一份 stage3_inputs 策略视图，读取轨迹 face/body 特征与共现证据；可结合 semantic_identity_decisions。所有输入应来自同一明确的运行/策略集合。
-
-### 处理过程
-
-抽取/整理 embedding → 建候选配对 → 检查人脸相似度和反证 → cannot-link 优先、簇间兼容的合并 → 晋升 CHR 或留 pending。检测帧共现是硬负约束，只有区间交叠而没有检测共现的情况进入 overlap_review_pairs。身份图和合并边保留，以支持以后拆分/回溯。
-
-### 产物与消费
-
-目录含 `registry.json`、`tracklet_features.json`、`identity_graph.json`、`merge_evidence.jsonl`、`cannot_links.json`、`possible_links.json`、`overlap_review_pairs.json`、`candidates/*.json`，以及已晋升人物目录下 `character.json/tracklets.json`。registry 中有 characters、pending_candidates、pending_links、约束违规计数和输入参数。消费方：旧画廊、旧角色绑定、身份审计页面。
-
-### 异常、重跑与成本
-
-无脸/低质量证据保留未决，不强行分配 CHR。不可把 CHR 数量当人物召回率；分母和真值不在该字段中。聚类参数或输入策略变更要重建身份图与下游画廊。
-
-### 展示与验收
-
-默认人物卡 + pending 数，开发模式展开图、合并理由和不能合并的证据。验收 cannot_link_violation_count、成员来源、身份图可追溯。
-<!-- /module:legacy_identity -->
-
-<!-- module:legacy_gallery -->
-## 14 · 视觉人物画廊
-
-```json pipeline-module
-{
-  "id":"legacy_gallery","title":"视觉人物画廊","order":140,"group":"people","lifecycle":"legacy","implementation":"existing",
-  "summary":"为每个 CHR 挑选质量、纯度和多样性合适的脸部/身体参考图。",
-  "depends_on":["legacy_identity"],"optional_depends_on":[],"inputs":["visual_identity"],
-  "source_refs":["assets/visual_person/character_asset_bank.py"],"evidence":["code","sample"],
-  "outputs":[{"id":"chr_gallery","title":"CHR 资产画廊","kind":"directory","paths":{"custom":["{asset_bank}"]},"record_key":["character_id"],"timebase":"none","schema":"mixed","required":true}],
-  "view":{"enabled":true,"renderer":"character-gallery","adapter":"chr-gallery-v1","filters":["subject","status"],"primary_artifact":"chr_gallery"}
-}
-```
-
-### 作用与判断
-
-从身份簇证据中挑可用参考图；画廊整理与身份聚类是两个步骤。图多不代表身份更准确。
-
-### 输入与前置条件
-
-legacy_identity 的 registry 和 tracklet_features，源裁图必须可读。可选人工 reviewed 稳定描述，不能把生成描述当审核事实。
-
-### 处理过程
-
-按脸/身体分组，结合质量、脸部纯度、感知哈希/embedding 去重、视角及 appearance_state 选择。默认 face/body top-k 各 5、最小质量各 0.45；这些是该脚本参数，不应套到新 materializer 的 top-k 8。
-
-### 产物与消费
-
-根 `registry.json`；人物目录中的 `character.json/assets.json/tracklets.json/appearance_states.json` 和脸/身体/RGBA 图。字段里的资产路径是准确定位依据。被旧角色绑定以及外部人物 I2I 测试消费。
-
-### 异常、重跑与成本
-
-质量不足可以没有某种视角，不能补空白图伪装完整。源裁图失效时记录不可读，重建画廊无需重跑人物检测，前提是原始证据仍完整。
-
-### 展示与验收
-
-按脸、全身、外观状态浏览，展示来源轨迹与质量依据。默认不加载大量 embedding。验收去重、文件有效、每张图能追到来源。
-<!-- /module:legacy_gallery -->
-
-<!-- module:voice_model -->
-## 15 · 声音身份与净语音证据
-
-```json pipeline-module
-{
-  "id":"voice_model","title":"声音身份与净语音证据","order":150,"group":"audio","lifecycle":"optional","implementation":"existing",
-  "summary":"从 global 音频建立说话人时间线、重叠区间和可复核的声音参考。",
-  "depends_on":["global_group"],"optional_depends_on":[],"inputs":["globals","global_media"],
-  "source_refs":["assets/voice/speaker_voice_asset_pipeline.py","assets/voice/audio_foreground_separator.py","assets/voice/speaker_overlap_detector.py","assets/voice/speaker_registry_builder.py","assets/voice/speaker_turn_foreground_gate.py","assets/voice/cocktail_asr.py"],"evidence":["code"],
-  "outputs":[{"id":"speaker_registry","title":"声音建模产物","kind":"directory","paths":{"custom":["{output}"]},"record_key":["speaker_id"],"timebase":"global_local","schema":"mixed","required":true}],
-  "view":{"enabled":true,"renderer":"audio-evidence","adapter":"speaker-registry-v1","filters":["scope","subject","status"],"primary_artifact":"speaker_registry"}
-}
-```
-
-### 作用与判断
-
-音频主体是 SPK，判断依据为声音和时间，不自动知道画面中的 S-ID。增强链提供去噪/前景、说话人分段、重叠排除和参考音频身份证据，供后续音画关联。
-
-### 输入与前置条件
-
-入口 `speaker_voice_asset_pipeline.py run`，输入一个视频、独立输出根；需要 ClearVoice/MossFormer2_SE、说话人分离/embedding、重叠检测等本地模型。可以传 VAD/diarization/ASR JSON 复用已有结果。此链不依赖 caption，因此可与视觉并行。
-
-### 处理过程
-
-前景人声分离 → 重叠检测 → 在前景 stem 上建立 speech windows、局部 speaker tracklets 和 turn → CAM++ 身份特征/约束聚类 → foreground gate → 收集 speaker pools、合并证据 → 排除 simultaneous speech → 生成 consolidated 参考和审计。可选双路径验证比较增强声轨与原混音的身份；默认 shadow 记录与启用 enforce 拒绝是不同语义。
-
-当前未提交的 builder 已用 CocktailASR 替换原 Transcriber，默认模型路径改为 `local_models/Xiaomi-CocktailASR-1`。自动参考属于目标说话人转写，不能证明覆盖所有人；需显式时间分段/可靠 ASR 输入，才能支撑句级音频。保留 `--asr-json` 的历史参数名称不表示仍运行 Whisper。
-
-### 产物与消费
-
-增强目录的 `foreground_report.json` 及前景/原声路径；`overlap/overlap_report.json`；`stage5/registry.json`、`registry.pregate.json`、`registry.gate.json` 和 timeline、speech_windows、local_speaker_tracklets、speaker_turns、asr_timeline、global_speaker_timeline、overlap_regions、must/possible/cannot_links、unknown_turns 等 JSON。
-
-`consolidated/` 包含 `registry.json/voice_asset_library.json/consolidation.json/speaker_turns.json/global_speaker_timeline.json/simultaneous_speech_regions.json` 等，具体参考 WAV 由 registry 的 reference_audio 等字段指向；根 `compare.json/summary.json` 汇总。消费方：voice_preview 的可选 voice_link、旧角色绑定的审核音频和声音证据页面。0916 整合目录没有这整套产物，不能自动显示为已完成。
-
-### 异常、重跑与成本
-
-这是较重 GPU/音频模型链；关 ASR、关重叠排除、复用 JSON 都会改变质量含义，必须展示配置。无合格语音证据允许不输出正式参考。模型/路径错误不能降格解释成“该角色没有声音”。
-
-### 展示与验收
-
-并排听原音、前景、净语音，画出 turn 与重叠条，显示参考录音准入原因。验收时基一致、SPK 不被误当 S-ID、被排除区间与净语音时长可追溯。
-<!-- /module:voice_model -->
-
 <!-- module:voice_preview -->
-## 16 · 角色声音候选
+## 11 · 角色声音候选
 
 ```json pipeline-module
 {
-  "id":"voice_preview","title":"角色声音候选","order":160,"group":"audio","lifecycle":"active","implementation":"existing",
+  "id":"voice_preview","title":"角色声音候选","order":110,"group":"audio","lifecycle":"active","implementation":"existing",
   "summary":"按全局 ASR 的精确区间裁出声音预览，并保留候选、拒绝和审核证据。",
   "depends_on":["global_describe"],"optional_depends_on":["voice_model"],"inputs":["attributed_asr","speaker_registry"],
   "source_refs":["assets/voice/export_all_asr_audio_review.py"],"evidence":["code","sample"],
@@ -781,11 +575,11 @@ legacy_identity 的 registry 和 tracklet_features，源裁图必须可读。可
 <!-- /module:voice_preview -->
 
 <!-- module:character_pack -->
-## 17 · 角色素材汇总
+## 12 · 角色素材汇总
 
 ```json pipeline-module
 {
-  "id":"character_pack","title":"角色素材汇总","order":170,"group":"characters","lifecycle":"active","implementation":"existing",
+  "id":"character_pack","title":"角色素材汇总","order":120,"group":"characters","lifecycle":"active","implementation":"existing",
   "summary":"按 global 与 S-ID 汇集轨迹裁图和候选声音，形成便于查看的角色目录。",
   "depends_on":["person_align","person_tracks","voice_preview"],"optional_depends_on":[],"inputs":["direct_alignment","tracklets","voice_previews"],
   "source_refs":["global_align_pipeline/global_character_materializer.py"],"evidence":["code","sample"],
@@ -824,54 +618,12 @@ legacy_identity 的 registry 和 tracklet_features，源裁图必须可读。可
 角色卡明确 scope、语义描述、轨迹证据、脸/身体/声音数量，点击返回来源；未知候选集合单独显示。验收复制数与文件数、来源可读、音频候选标签和破坏性重跑说明。
 <!-- /module:character_pack -->
 
-<!-- module:legacy_bind -->
-## 18 · 旧链角色身份绑定
-
-```json pipeline-module
-{
-  "id":"legacy_bind","title":"旧链角色身份绑定","order":180,"group":"characters","lifecycle":"legacy","implementation":"existing",
-  "summary":"把 CHR 视觉身份投票映射到 S-ID，并按审核证据决定可交付声音。",
-  "depends_on":["legacy_refine","legacy_identity","legacy_gallery"],"optional_depends_on":["voice_preview"],"inputs":["semantic_tracklet_views","visual_identity","chr_gallery","reviewed_voice"],
-  "source_refs":["assets/character_role_aligner.py"],"evidence":["code"],
-  "outputs":[
-    {"id":"role_binding","title":"CHR 与 S-ID 绑定报告","kind":"json","paths":{"custom":["{output}/role_alignment.json"]},"record_key":[],"timebase":"none","schema":"mixed","required":true},
-    {"id":"legacy_characters","title":"旧链角色资产目录","kind":"directory","paths":{"custom":["{output}/characters"]},"record_key":["scope","subject_id"],"timebase":"none","schema":"mixed","required":false}
-  ],
-  "view":{"enabled":true,"renderer":"character-gallery","adapter":"characters-legacy-v1","filters":["scope","subject","status"],"primary_artifact":"role_binding"}
-}
-```
-
-### 作用与判断
-
-解决“视觉 CHR”与“语义/音频 S-ID”的名字不一致。与新 materializer 直接复制声音候选不同，当前旧绑定实现要求声音的明确审核和身份关联。
-
-### 输入与前置条件
-
-identity、同策略的 stage3-view、asset-bank；可选 voice-export。无审核清单仍可产出视觉结果，但不得悄悄从预览 WAV 补正式声音。
-
-### 处理过程
-
-轨迹票重为置信度乘决策系数（primary 1、supporting 0.85、context 0.5）；先在同 `(scope,shot,subject)` 取最大票，避免碎轨迹重复投票；再跨 shot 聚合。默认 min-share 0.6、min-weight 1.0、contest-margin 0.15，分别区分 confirmed/contested/weak/unresolved。冲突 winner 默认取更强者，其他记录保留。可选画廊复核和低频准入要展示开关。
-
-### 产物与消费
-
-`role_alignment.json` 记录 `chr_to_roles/role_to_chr/id_conflicts` 等；可选角色目录内复制 CHR 画廊，记录 role_character。声音只采用 `voice_asset_manifest.jsonl` 中 `review_status=approved` 且 `voice_link.status=matched` 的 consolidated reference_audio；无准入则记 voice_skipped_reason。输出用于旧链展示、I2I 引用及新旧对照。
-
-### 异常、重跑与成本
-
-投票主要为轻量计算，画廊复核可能增加特征计算。复制前可能清理旧声音目录，重跑要保留审核来源。多个 CHR 认领同 S-ID 时不能静默合并画廊来制造“一致身份”。
-
-### 展示与验收
-
-展示 CHR→scope:S-ID 映射、票重、冲突和未交付原因；声音卡区分审核资产与预览。验收没有批准清单时不产生“正式声音”，投票分母及同镜头去重正确。
-<!-- /module:legacy_bind -->
-
 <!-- module:object_queue -->
-## 19 · 关键物体候选
+## 13 · 关键物体候选
 
 ```json pipeline-module
 {
-  "id":"object_queue","title":"关键物体候选","order":190,"group":"objects","lifecycle":"active","implementation":"existing",
+  "id":"object_queue","title":"关键物体候选","order":130,"group":"objects","lifecycle":"active","implementation":"existing",
   "summary":"把镜头描述中的重要物体整理为带可见时间窗的定位候选。",
   "depends_on":["shot_describe"],"optional_depends_on":["legacy_refine"],"inputs":["shot_captions","semantic_tracklet_views"],
   "source_refs":["assets/key_object/build_object_grounding_queue_v1.py","assets/key_object/build_object_grounding_queue_v2.py","assets/visual_person/semantic_role_tracklet_refiner_v3.py","build_object_grounding_queue_from_shot_captions_v1.py"],"evidence":["code","sample"],
@@ -906,11 +658,11 @@ identity、同策略的 stage3-view、asset-bank；可选 voice-export。无审�
 <!-- /module:object_queue -->
 
 <!-- module:object_ground -->
-## 20 · 关键物体定位与分割
+## 14 · 关键物体定位与分割
 
 ```json pipeline-module
 {
-  "id":"object_ground","title":"关键物体定位与分割","order":200,"group":"objects","lifecycle":"active","implementation":"existing",
+  "id":"object_ground","title":"关键物体定位与分割","order":140,"group":"objects","lifecycle":"active","implementation":"existing",
   "summary":"在候选可见区间内验证物体实例，产出裁图、透明前景和可追踪的多帧证据。",
   "depends_on":["object_queue","shot_split"],"optional_depends_on":[],"inputs":["object_candidates","shot_media","shots"],
   "source_refs":["assets/key_object/object_grounding_segmenter_v1.py","assets/key_object/object_grounding_segmenter_v2.py","assets/key_object/object_grounding_segmenter_v3.py"],"evidence":["code","sample"],
@@ -952,11 +704,11 @@ GroundingDINO 给文本对象候选框，SAM3.1 按几何提示分割；还要�
 <!-- /module:object_ground -->
 
 <!-- module:scene_select -->
-## 21 · 场景参考图
+## 15 · 场景参考图
 
 ```json pipeline-module
 {
-  "id":"scene_select","title":"场景参考图","order":210,"group":"scenes","lifecycle":"active","implementation":"existing",
+  "id":"scene_select","title":"场景参考图","order":150,"group":"scenes","lifecycle":"active","implementation":"existing",
   "summary":"发现视觉场景，选择遮挡较少、结构清晰且互补的参考帧。",
   "depends_on":["global_group"],"optional_depends_on":[],"inputs":["globals","global_media"],
   "source_refs":["assets/scene/important_scene_frame_extractor.py"],"evidence":["code","sample"],
@@ -995,12 +747,65 @@ GPU 特征提取与检测是主要成本；仅改变选帧策略是否能复用�
 按场景展示主图和辅助图，支持默认与 marginal 同位置对比；标出时刻、遮挡比例和“辅助帧同场景约束”。验收参考图可定位、聚类数量与实际一致，不把 frame_score 当审美真值。
 <!-- /module:scene_select -->
 
-<!-- module:generation_bundle -->
-## 22 · 图像生成任务包
+## 支线、扩展与外部模块（不在主线讲解路径中）
+
+以下模块不属于主线：或是最新 15 阶段主线之外的可选/外部/基础设施步骤，或是明确降为支线的历史流程。它们仍被完整收录（模块元数据、六段说明与产物契约不变），供对照、复跑与兼容展示，但默认不出现在主线讲解路线与首屏导航中；网站里它们位于最末分组，需打开“显示兼容/实验模块”或在系统介绍中选择对应路线才能看到。
+
+- 扩展与外部模块（主线之外）：可选预处理（source_prepare）、图像生成任务包（generation_bundle）、图像/语音生成效果对比（i2i_review / tts_review，外部工具）、结果文件与服务（result_browse，展示基础设施，含旧 asset_viewer）。
+- 声音增强支路（voice_model）：全局视频 → 前景分离 / 重叠检测 / 说话人建模 → 净语音与审核证据。可独立运行，产出 SPK 身份；不依赖视觉人物归属，也不会自动得到 S-ID。
+- 旧 CHR 人物链（legacy_refine → legacy_identity → legacy_gallery → legacy_bind）：逐镜头 LLM 语义标注 → 跨镜头身份聚类 → 视觉画廊 → 投票绑定到 S-ID。与新链（轨迹直接全局归属）是替代/对照关系，不是必经步骤。
+- 兼容与实验支路（compat_structure、asset_demo）：旧 ClipRecord 工作区结构与历史 real/stub 资产演示。
+
+对应讲解路线：legacy-chr（CHR 聚类与角色映射）、audio-evidence（前景声音与身份验证）。
+
+<!-- module:source_prepare -->
+## 16 · 输入与预处理
 
 ```json pipeline-module
 {
-  "id":"generation_bundle","title":"图像生成任务包","order":220,"group":"generation","lifecycle":"optional","implementation":"existing",
+  "id":"source_prepare","title":"输入与预处理","order":160,"group":"compatibility","lifecycle":"optional","implementation":"existing",
+  "summary":"确认源视频及时间坐标，按需移除片头片尾低内容区间。",
+  "depends_on":[],"optional_depends_on":[],"inputs":[],
+  "source_refs":["preprocessing/preprocess.py"],"evidence":["code"],
+  "outputs":[
+    {"id":"source_video","title":"切镜输入视频","kind":"media","paths":{"custom":["{source_video}"]},"record_key":[],"timebase":"source","schema":"unversioned","required":true},
+    {"id":"preprocess_info","title":"预处理区间报告","kind":"json","paths":{"custom":["{output}/processed_info.json"]},"record_key":[],"timebase":"source","schema":"unversioned","required":false}
+  ],
+  "view":{"enabled":true,"renderer":"source-overview","adapter":"source-v1","filters":[],"primary_artifact":"source_video"}
+}
+```
+
+### 作用与判断
+
+输入登记是概念上的必需步骤，执行裁剪是可选动作。`preprocessing/preprocess.py` 用低亮度、低音量和相邻采样帧平均亮度变化判断候选丢弃区间；它不是语义片头/字幕识别器，静态剧情也可能被命中。
+
+### 输入与前置条件
+
+输入本地视频，依赖 ffmpeg/ffprobe、numpy。先确认视频/音轨可读取，以及后续究竟使用原片还是处理后视频。当前两套 caption 编排的 `all` 都不会自动执行这里。
+
+### 处理过程
+
+默认 2 fps 稀疏采样、亮度阈值 8、静态变化阈值 1.5、音量 RMS 阈值 0.005；只接受前 180 秒、后 240 秒范围内的候选区间，合并相邻 drop，求保留区间，再切割拼接。实际 CLI 默认值优先于旧 docstring 示例。保留区间可以不止一个。
+
+### 产物与消费
+
+`processed_info.json` 记录 `source/duration_sec/trimmed_sec/kept_intervals/drops/processed_video`；处理视频路径以 `processed_video` 为准。没有裁剪时可直接引用原片。`source_video` 被切镜模块消费；区间报告用于原片与处理后时间互译及网页解释。
+
+### 异常、重跑与成本
+
+这是 CPU 解码与 I/O 工作；stream-copy 切割不应被描述为逐帧精确剪辑。无音轨等输入异常需要预检。改变预处理会改变后续全部 source 时间和切片，不可继续无条件复用旧描述/资产。
+
+### 展示与验收
+
+展示源片信息、处理前后时长和丢弃时间条；可点击看丢弃区间。未执行显示“使用原片”，不显示失败。验收时间映射、保留区间有序不重叠和输出可读。
+<!-- /module:source_prepare -->
+
+<!-- module:generation_bundle -->
+## 17 · 图像生成任务包
+
+```json pipeline-module
+{
+  "id":"generation_bundle","title":"图像生成任务包","order":170,"group":"compatibility","lifecycle":"optional","implementation":"existing",
   "summary":"将片段描述、场景和物体参考整理成可复核的 I2I 输入包。",
   "depends_on":["segment_describe"],"optional_depends_on":["scene_select","object_queue","object_ground","legacy_bind","character_pack"],"inputs":["segment_captions","scene_assets","object_candidates","object_observations","object_references","role_binding","characters"],
   "source_refs":["assets/character_role_aligner.py"],"evidence":["code","sample"],
@@ -1040,11 +845,11 @@ GPU 特征提取与检测是主要成本；仅改变选帧策略是否能复用�
 <!-- /module:generation_bundle -->
 
 <!-- module:i2i_review -->
-## 23 · 图像生成效果对比
+## 18 · 图像生成效果对比
 
 ```json pipeline-module
 {
-  "id":"i2i_review","title":"图像生成效果对比","order":230,"group":"generation","lifecycle":"external","implementation":"external",
+  "id":"i2i_review","title":"图像生成效果对比","order":180,"group":"compatibility","lifecycle":"external","implementation":"external",
   "summary":"对比同一参考和目标下不同图像模型的输出，保留输入与参数。",
   "depends_on":[],"optional_depends_on":["generation_bundle","legacy_gallery"],"inputs":["i2i_bundles","chr_gallery"],
   "source_refs":["asset_viewer/pipeline_router.py"],"evidence":["sample","code"],
@@ -1079,11 +884,11 @@ GPU 特征提取与检测是主要成本；仅改变选帧策略是否能复用�
 <!-- /module:i2i_review -->
 
 <!-- module:tts_review -->
-## 24 · 语音合成效果对比
+## 19 · 语音合成效果对比
 
 ```json pipeline-module
 {
-  "id":"tts_review","title":"语音合成效果对比","order":240,"group":"generation","lifecycle":"external","implementation":"external",
+  "id":"tts_review","title":"语音合成效果对比","order":190,"group":"compatibility","lifecycle":"external","implementation":"external",
   "summary":"对比参考声音和多个 TTS 模型的合成结果及文本。",
   "depends_on":[],"optional_depends_on":["voice_preview","voice_model","character_pack"],"inputs":["voice_previews","speaker_registry","characters"],
   "source_refs":["asset_viewer/pipeline_router.py"],"evidence":["sample","code"],
@@ -1117,12 +922,253 @@ TTS 对比评估的是参考条件下的合成效果，不自动验证上游身�
 统一的参考音频 + 模型结果列表，切换播放自动暂停上一条。验收引用正确、重复 S-ID 不跨 scope 合并、播放有文字标签，键盘可操作。
 <!-- /module:tts_review -->
 
-<!-- module:compat_structure -->
-## 25 · ClipRecord 兼容结构链
+<!-- module:result_browse -->
+## 20 · 结果文件与服务
 
 ```json pipeline-module
 {
-  "id":"compat_structure","title":"ClipRecord 兼容结构链","order":250,"group":"compatibility","lifecycle":"legacy","implementation":"existing",
+  "id":"result_browse","title":"结果文件与服务","order":200,"group":"compatibility","lifecycle":"active","implementation":"existing",
+  "summary":"读取已落盘结果，为浏览器提供目录、详情和媒体播放。",
+  "depends_on":[],"optional_depends_on":["segment_export","character_pack","legacy_bind","object_ground","scene_select","i2i_review","tts_review"],"inputs":["segment_media","characters","legacy_characters","object_observations","scene_assets","i2i_results","tts_results"],
+  "source_refs":["asset_viewer/server.py","asset_viewer/pipeline_router.py","asset_viewer/parsers.py","asset_viewer/html_template.py"],"evidence":["code"],
+  "outputs":[{"id":"workspace_artifacts","title":"可浏览产物目录","kind":"directory","paths":{"integrated":["."],"basic-flat":["."],"scheme-a":["."],"custom":["{workspace}"]},"record_key":[],"timebase":"none","schema":"mixed","required":true}],
+  "view":{"enabled":true,"renderer":"artifact-browser","adapter":"workspace-artifacts-v1","filters":["status"],"primary_artifact":"workspace_artifacts"}
+}
+```
+
+### 作用与判断
+
+现有 asset_viewer 用标准库 ThreadingHTTPServer + Python 内嵌 HTML/JS 提供只读浏览。它只读结果，不参与产生轨迹或 caption，也没有本文档驱动导航/热加载能力。
+
+### 输入与前置条件
+
+工作区根、默认/唯一工作区、端口和平台 base-url。当前自动发现要求目录名前缀 `movie_full_pipeline_`，且 detect_chain 能识别新对齐或旧资产库；纯 caption 工作区可能被过滤掉。默认 CLI 端口 8910、host 0.0.0.0；实际暴露范围由启动参数决定，常量 DEFAULT_WORKSPACE 不等于 CLI 强制只暴露该目录。
+
+### 处理过程
+
+发现工作区 → 根据固定路径检查 stage → 枚举实体/解析详情 → 前端根据硬编码 stage 分支渲染。支持工作区、阶段、scope、subject 选择和永久链接；媒体端点实现 Range 读取。工作区注册表启动后缓存，不是实时监听文档/产物的机制。
+
+### 产物与消费
+
+API 包括 `/api/workspaces`、`/api/stages`、`/api/entities`、`/api/character`、`/api/global`、`/api/tracklet`、`/api/global_clip`、`/api/scene`、`/api/key_object`、`/api/i2i_bundle`、`/api/detail`、`/api/artifacts`、`/api/artifact`，媒体 `/media/path`；当前没有额外写入业务产物。
+
+### 异常、重跑与成本
+
+现有 README 称 resolve 后限制在 workspace 内；实际 `_safe_within_workspace` 使用 abspath 做词法范围检查以允许跨工作区软链接，二者不一致。新设计需在受控根内保留该使用场景，见文档三。读取坏 JSON/媒体缺失应显示局部错误，不能用空列表伪装成功。
+
+### 展示与验收
+
+沿用服务器监听和平台代理思路，升级为文档索引 + 布局适配器 + 渲染器注册制。部署和新 API 详见文档三；本次没有启动服务或验证平台网络可达。artifact-browser 仅列入已登记的结果目录，不递归暴露模型权重、日志秘密或代码配置。
+<!-- /module:result_browse -->
+
+<!-- module:voice_model -->
+## 21 · 声音身份与净语音证据
+
+```json pipeline-module
+{
+  "id":"voice_model","title":"声音身份与净语音证据","order":210,"group":"compatibility","lifecycle":"optional","implementation":"existing",
+  "summary":"从 global 音频建立说话人时间线、重叠区间和可复核的声音参考。",
+  "depends_on":["global_group"],"optional_depends_on":[],"inputs":["globals","global_media"],
+  "source_refs":["assets/voice/speaker_voice_asset_pipeline.py","assets/voice/audio_foreground_separator.py","assets/voice/speaker_overlap_detector.py","assets/voice/speaker_registry_builder.py","assets/voice/speaker_turn_foreground_gate.py","assets/voice/cocktail_asr.py"],"evidence":["code"],
+  "outputs":[{"id":"speaker_registry","title":"声音建模产物","kind":"directory","paths":{"custom":["{output}"]},"record_key":["speaker_id"],"timebase":"global_local","schema":"mixed","required":true}],
+  "view":{"enabled":true,"renderer":"audio-evidence","adapter":"speaker-registry-v1","filters":["scope","subject","status"],"primary_artifact":"speaker_registry"}
+}
+```
+
+### 作用与判断
+
+音频主体是 SPK，判断依据为声音和时间，不自动知道画面中的 S-ID。增强链提供去噪/前景、说话人分段、重叠排除和参考音频身份证据，供后续音画关联。
+
+### 输入与前置条件
+
+入口 `speaker_voice_asset_pipeline.py run`，输入一个视频、独立输出根；需要 ClearVoice/MossFormer2_SE、说话人分离/embedding、重叠检测等本地模型。可以传 VAD/diarization/ASR JSON 复用已有结果。此链不依赖 caption，因此可与视觉并行。
+
+### 处理过程
+
+前景人声分离 → 重叠检测 → 在前景 stem 上建立 speech windows、局部 speaker tracklets 和 turn → CAM++ 身份特征/约束聚类 → foreground gate → 收集 speaker pools、合并证据 → 排除 simultaneous speech → 生成 consolidated 参考和审计。可选双路径验证比较增强声轨与原混音的身份；默认 shadow 记录与启用 enforce 拒绝是不同语义。
+
+当前未提交的 builder 已用 CocktailASR 替换原 Transcriber，默认模型路径改为 `local_models/Xiaomi-CocktailASR-1`。自动参考属于目标说话人转写，不能证明覆盖所有人；需显式时间分段/可靠 ASR 输入，才能支撑句级音频。保留 `--asr-json` 的历史参数名称不表示仍运行 Whisper。
+
+### 产物与消费
+
+增强目录的 `foreground_report.json` 及前景/原声路径；`overlap/overlap_report.json`；`stage5/registry.json`、`registry.pregate.json`、`registry.gate.json` 和 timeline、speech_windows、local_speaker_tracklets、speaker_turns、asr_timeline、global_speaker_timeline、overlap_regions、must/possible/cannot_links、unknown_turns 等 JSON。
+
+`consolidated/` 包含 `registry.json/voice_asset_library.json/consolidation.json/speaker_turns.json/global_speaker_timeline.json/simultaneous_speech_regions.json` 等，具体参考 WAV 由 registry 的 reference_audio 等字段指向；根 `compare.json/summary.json` 汇总。消费方：voice_preview 的可选 voice_link、旧角色绑定的审核音频和声音证据页面。0916 整合目录没有这整套产物，不能自动显示为已完成。
+
+### 异常、重跑与成本
+
+这是较重 GPU/音频模型链；关 ASR、关重叠排除、复用 JSON 都会改变质量含义，必须展示配置。无合格语音证据允许不输出正式参考。模型/路径错误不能降格解释成“该角色没有声音”。
+
+### 展示与验收
+
+并排听原音、前景、净语音，画出 turn 与重叠条，显示参考录音准入原因。验收时基一致、SPK 不被误当 S-ID、被排除区间与净语音时长可追溯。
+<!-- /module:voice_model -->
+
+<!-- module:legacy_refine -->
+## 22 · 逐镜头人物语义筛选
+
+```json pipeline-module
+{
+  "id":"legacy_refine","title":"逐镜头人物语义筛选","order":220,"group":"compatibility","lifecycle":"legacy","implementation":"existing",
+  "summary":"为旧 CHR 链给轨迹附加 S-ID、叙事重要性与筛选策略。",
+  "depends_on":["person_tracks","global_describe"],"optional_depends_on":["shot_describe","segment_describe"],"inputs":["tracklets","global_captions","shot_captions","segment_captions"],
+  "source_refs":["assets/visual_person/semantic_role_tracklet_refiner.py","assets/visual_person/semantic_role_tracklet_refiner_v2.py","assets/visual_person/semantic_role_tracklet_refiner_v3.py"],"evidence":["code","sample"],
+  "outputs":[{"id":"semantic_tracklet_views","title":"语义筛选与策略视图","kind":"directory","paths":{"custom":["{output}"]},"record_key":["shot_id","tracklet_id"],"timebase":"shot_local","schema":"mixed","required":true}],
+  "view":{"enabled":true,"renderer":"alignment-evidence","adapter":"semantic-tracklets-v3","filters":["scope","shot","variant","status"],"primary_artifact":"semantic_tracklet_views"}
+}
+```
+
+### 作用与判断
+
+对每个 shot 让 MiMo 对齐语义角色，输出 keep_primary/keep_supporting/keep_context/reject/review 等决策；只在旧链中作为身份聚类的上游筛选，不是新全局链的必经步骤。
+
+### 输入与前置条件
+
+读取 tracklet 签名和 caption 上下文，保留原始轨迹证据；选择 primary、narrative 或 safe 策略时必须记录具体策略。
+
+### 处理过程
+
+打包镜头与轨迹 → 模型判断 → 校验角色集合/重要性/拒绝置信度 → 低证据拒绝改为 review → 输出不同保留视图。safe 是仅排除高置信背景/非人物的保守视图；primary 会显著减少进入下一步的轨迹。V2 增加物体提案，V3 保留其可见时间窗到 grounding 候选。
+
+### 产物与消费
+
+`alignment_results.jsonl`、`alignments/<SHOT>.json`、`semantic_tracklet_index.json`、`manifest.json`；`stage3_inputs/{primary,narrative,safe}/shots/<SHOT>/tracklet_signatures.json` 和 `semantic_identity_decisions.json`；V2/V3 另有 `object_proposals.jsonl/object_grounding_candidates.jsonl`。消费方为 legacy_identity；物体提案可以作为另一路 grounding 来源，必须标注与直接 shot queue 的区别。
+
+### 异常、重跑与成本
+
+此处按 shot 调用 VLM，成本随镜头数增加。失败保守保留不等于身份已确认。改变策略要单独重建其后 CHR 结果；不能混用 primary registry 和 narrative gallery。
+
+### 展示与验收
+
+展示输入轨迹数、各策略保留数和拒绝原因，支持看被过滤轨迹。验收每个视图的来源/策略一致，筛除数可解释。
+<!-- /module:legacy_refine -->
+
+<!-- module:legacy_identity -->
+## 23 · 跨镜头身份聚类
+
+```json pipeline-module
+{
+  "id":"legacy_identity","title":"跨镜头身份聚类","order":230,"group":"compatibility","lifecycle":"legacy","implementation":"existing",
+  "summary":"使用脸部和身体证据构建可追溯的视觉身份图，保留不确定候选。",
+  "depends_on":["legacy_refine"],"optional_depends_on":[],"inputs":["semantic_tracklet_views"],
+  "source_refs":["assets/visual_person/visual_character_registry_builder.py"],"evidence":["code","sample"],
+  "outputs":[{"id":"visual_identity","title":"视觉身份图与 CHR 注册表","kind":"directory","paths":{"custom":["{identity}"]},"record_key":["character_id"],"timebase":"mixed","schema":"cross-shot-identity-v2","required":true}],
+  "view":{"enabled":true,"renderer":"identity-graph","adapter":"visual-identity-v2","filters":["scope","status"],"primary_artifact":"visual_identity"}
+}
+```
+
+### 作用与判断
+
+把多个 shot 的轨迹聚为视觉身份 CHR。脸部证据优先，身体辅助；MUST_LINK、POSSIBLE_LINK、CANNOT_LINK 是不同证据等级，不是全部直接并入同一人。
+
+### 输入与前置条件
+
+选定一份 stage3_inputs 策略视图，读取轨迹 face/body 特征与共现证据；可结合 semantic_identity_decisions。所有输入应来自同一明确的运行/策略集合。
+
+### 处理过程
+
+抽取/整理 embedding → 建候选配对 → 检查人脸相似度和反证 → cannot-link 优先、簇间兼容的合并 → 晋升 CHR 或留 pending。检测帧共现是硬负约束，只有区间交叠而没有检测共现的情况进入 overlap_review_pairs。身份图和合并边保留，以支持以后拆分/回溯。
+
+### 产物与消费
+
+目录含 `registry.json`、`tracklet_features.json`、`identity_graph.json`、`merge_evidence.jsonl`、`cannot_links.json`、`possible_links.json`、`overlap_review_pairs.json`、`candidates/*.json`，以及已晋升人物目录下 `character.json/tracklets.json`。registry 中有 characters、pending_candidates、pending_links、约束违规计数和输入参数。消费方：旧画廊、旧角色绑定、身份审计页面。
+
+### 异常、重跑与成本
+
+无脸/低质量证据保留未决，不强行分配 CHR。不可把 CHR 数量当人物召回率；分母和真值不在该字段中。聚类参数或输入策略变更要重建身份图与下游画廊。
+
+### 展示与验收
+
+默认人物卡 + pending 数，开发模式展开图、合并理由和不能合并的证据。验收 cannot_link_violation_count、成员来源、身份图可追溯。
+<!-- /module:legacy_identity -->
+
+<!-- module:legacy_gallery -->
+## 24 · 视觉人物画廊
+
+```json pipeline-module
+{
+  "id":"legacy_gallery","title":"视觉人物画廊","order":240,"group":"compatibility","lifecycle":"legacy","implementation":"existing",
+  "summary":"为每个 CHR 挑选质量、纯度和多样性合适的脸部/身体参考图。",
+  "depends_on":["legacy_identity"],"optional_depends_on":[],"inputs":["visual_identity"],
+  "source_refs":["assets/visual_person/character_asset_bank.py"],"evidence":["code","sample"],
+  "outputs":[{"id":"chr_gallery","title":"CHR 资产画廊","kind":"directory","paths":{"custom":["{asset_bank}"]},"record_key":["character_id"],"timebase":"none","schema":"mixed","required":true}],
+  "view":{"enabled":true,"renderer":"character-gallery","adapter":"chr-gallery-v1","filters":["subject","status"],"primary_artifact":"chr_gallery"}
+}
+```
+
+### 作用与判断
+
+从身份簇证据中挑可用参考图；画廊整理与身份聚类是两个步骤。图多不代表身份更准确。
+
+### 输入与前置条件
+
+legacy_identity 的 registry 和 tracklet_features，源裁图必须可读。可选人工 reviewed 稳定描述，不能把生成描述当审核事实。
+
+### 处理过程
+
+按脸/身体分组，结合质量、脸部纯度、感知哈希/embedding 去重、视角及 appearance_state 选择。默认 face/body top-k 各 5、最小质量各 0.45；这些是该脚本参数，不应套到新 materializer 的 top-k 8。
+
+### 产物与消费
+
+根 `registry.json`；人物目录中的 `character.json/assets.json/tracklets.json/appearance_states.json` 和脸/身体/RGBA 图。字段里的资产路径是准确定位依据。被旧角色绑定以及外部人物 I2I 测试消费。
+
+### 异常、重跑与成本
+
+质量不足可以没有某种视角，不能补空白图伪装完整。源裁图失效时记录不可读，重建画廊无需重跑人物检测，前提是原始证据仍完整。
+
+### 展示与验收
+
+按脸、全身、外观状态浏览，展示来源轨迹与质量依据。默认不加载大量 embedding。验收去重、文件有效、每张图能追到来源。
+<!-- /module:legacy_gallery -->
+
+<!-- module:legacy_bind -->
+## 25 · 旧链角色身份绑定
+
+```json pipeline-module
+{
+  "id":"legacy_bind","title":"旧链角色身份绑定","order":250,"group":"compatibility","lifecycle":"legacy","implementation":"existing",
+  "summary":"把 CHR 视觉身份投票映射到 S-ID，并按审核证据决定可交付声音。",
+  "depends_on":["legacy_refine","legacy_identity","legacy_gallery"],"optional_depends_on":["voice_preview"],"inputs":["semantic_tracklet_views","visual_identity","chr_gallery","reviewed_voice"],
+  "source_refs":["assets/character_role_aligner.py"],"evidence":["code"],
+  "outputs":[
+    {"id":"role_binding","title":"CHR 与 S-ID 绑定报告","kind":"json","paths":{"custom":["{output}/role_alignment.json"]},"record_key":[],"timebase":"none","schema":"mixed","required":true},
+    {"id":"legacy_characters","title":"旧链角色资产目录","kind":"directory","paths":{"custom":["{output}/characters"]},"record_key":["scope","subject_id"],"timebase":"none","schema":"mixed","required":false}
+  ],
+  "view":{"enabled":true,"renderer":"character-gallery","adapter":"characters-legacy-v1","filters":["scope","subject","status"],"primary_artifact":"role_binding"}
+}
+```
+
+### 作用与判断
+
+解决“视觉 CHR”与“语义/音频 S-ID”的名字不一致。与新 materializer 直接复制声音候选不同，当前旧绑定实现要求声音的明确审核和身份关联。
+
+### 输入与前置条件
+
+identity、同策略的 stage3-view、asset-bank；可选 voice-export。无审核清单仍可产出视觉结果，但不得悄悄从预览 WAV 补正式声音。
+
+### 处理过程
+
+轨迹票重为置信度乘决策系数（primary 1、supporting 0.85、context 0.5）；先在同 `(scope,shot,subject)` 取最大票，避免碎轨迹重复投票；再跨 shot 聚合。默认 min-share 0.6、min-weight 1.0、contest-margin 0.15，分别区分 confirmed/contested/weak/unresolved。冲突 winner 默认取更强者，其他记录保留。可选画廊复核和低频准入要展示开关。
+
+### 产物与消费
+
+`role_alignment.json` 记录 `chr_to_roles/role_to_chr/id_conflicts` 等；可选角色目录内复制 CHR 画廊，记录 role_character。声音只采用 `voice_asset_manifest.jsonl` 中 `review_status=approved` 且 `voice_link.status=matched` 的 consolidated reference_audio；无准入则记 voice_skipped_reason。输出用于旧链展示、I2I 引用及新旧对照。
+
+### 异常、重跑与成本
+
+投票主要为轻量计算，画廊复核可能增加特征计算。复制前可能清理旧声音目录，重跑要保留审核来源。多个 CHR 认领同 S-ID 时不能静默合并画廊来制造“一致身份”。
+
+### 展示与验收
+
+展示 CHR→scope:S-ID 映射、票重、冲突和未交付原因；声音卡区分审核资产与预览。验收没有批准清单时不产生“正式声音”，投票分母及同镜头去重正确。
+<!-- /module:legacy_bind -->
+
+<!-- module:compat_structure -->
+## 26 · ClipRecord 兼容结构链
+
+```json pipeline-module
+{
+  "id":"compat_structure","title":"ClipRecord 兼容结构链","order":260,"group":"compatibility","lifecycle":"legacy","implementation":"existing",
   "summary":"保留旧工作区的镜头导入、ASR 辅助再切割和质量加权窗口聚合。",
   "depends_on":["shot_split"],"optional_depends_on":[],"inputs":["shots"],
   "source_refs":["common/workspace.py","common/clip_store.py","common/jsonl.py","schema/records.py","m02_shots/importer.py","m04_recut/run.py","m04_recut/cutter.py","m07_segment/run.py","m07_segment/window.py","m07_segment/consistency.py"],"evidence":["code"],
@@ -1157,11 +1203,11 @@ recut 会更新原记录和相邻关系，按工作区隔离。fixed_v4 虽接�
 <!-- /module:compat_structure -->
 
 <!-- module:asset_demo -->
-## 26 · 历史资产演示
+## 27 · 历史资产演示
 
 ```json pipeline-module
 {
-  "id":"asset_demo","title":"历史资产演示","order":260,"group":"compatibility","lifecycle":"legacy","implementation":"existing",
+  "id":"asset_demo","title":"历史资产演示","order":270,"group":"compatibility","lifecycle":"legacy","implementation":"existing",
   "summary":"保留 segment 级 real/stub 资产演示的来源说明，防止占位结果被误当正式提取。",
   "depends_on":["source_prepare","segment_plan"],"optional_depends_on":[],"inputs":["source_video","segment_plan"],
   "source_refs":["assets_runner.py"],"evidence":["code"],
@@ -1195,51 +1241,13 @@ stub 仍可能调用 ffmpeg 抽帧/音频；real 会用 GPU，不能为试网页
 默认隐藏，可在历史模块页开启；醒目标注 stub/real。验收演示资产永不混入正式角色/对象 KPI。
 <!-- /module:asset_demo -->
 
-<!-- module:result_browse -->
-## 27 · 结果文件与服务
-
-```json pipeline-module
-{
-  "id":"result_browse","title":"结果文件与服务","order":270,"group":"service","lifecycle":"active","implementation":"existing",
-  "summary":"读取已落盘结果，为浏览器提供目录、详情和媒体播放。",
-  "depends_on":[],"optional_depends_on":["segment_export","character_pack","legacy_bind","object_ground","scene_select","i2i_review","tts_review"],"inputs":["segment_media","characters","legacy_characters","object_observations","scene_assets","i2i_results","tts_results"],
-  "source_refs":["asset_viewer/server.py","asset_viewer/pipeline_router.py","asset_viewer/parsers.py","asset_viewer/html_template.py"],"evidence":["code"],
-  "outputs":[{"id":"workspace_artifacts","title":"可浏览产物目录","kind":"directory","paths":{"integrated":["."],"basic-flat":["."],"scheme-a":["."],"custom":["{workspace}"]},"record_key":[],"timebase":"none","schema":"mixed","required":true}],
-  "view":{"enabled":true,"renderer":"artifact-browser","adapter":"workspace-artifacts-v1","filters":["status"],"primary_artifact":"workspace_artifacts"}
-}
-```
-
-### 作用与判断
-
-现有 asset_viewer 用标准库 ThreadingHTTPServer + Python 内嵌 HTML/JS 提供只读浏览。它只读结果，不参与产生轨迹或 caption，也没有本文档驱动导航/热加载能力。
-
-### 输入与前置条件
-
-工作区根、默认/唯一工作区、端口和平台 base-url。当前自动发现要求目录名前缀 `movie_full_pipeline_`，且 detect_chain 能识别新对齐或旧资产库；纯 caption 工作区可能被过滤掉。默认 CLI 端口 8910、host 0.0.0.0；实际暴露范围由启动参数决定，常量 DEFAULT_WORKSPACE 不等于 CLI 强制只暴露该目录。
-
-### 处理过程
-
-发现工作区 → 根据固定路径检查 stage → 枚举实体/解析详情 → 前端根据硬编码 stage 分支渲染。支持工作区、阶段、scope、subject 选择和永久链接；媒体端点实现 Range 读取。工作区注册表启动后缓存，不是实时监听文档/产物的机制。
-
-### 产物与消费
-
-API 包括 `/api/workspaces`、`/api/stages`、`/api/entities`、`/api/character`、`/api/global`、`/api/tracklet`、`/api/global_clip`、`/api/scene`、`/api/key_object`、`/api/i2i_bundle`、`/api/detail`、`/api/artifacts`、`/api/artifact`，媒体 `/media/path`；当前没有额外写入业务产物。
-
-### 异常、重跑与成本
-
-现有 README 称 resolve 后限制在 workspace 内；实际 `_safe_within_workspace` 使用 abspath 做词法范围检查以允许跨工作区软链接，二者不一致。新设计需在受控根内保留该使用场景，见文档三。读取坏 JSON/媒体缺失应显示局部错误，不能用空列表伪装成功。
-
-### 展示与验收
-
-沿用服务器监听和平台代理思路，升级为文档索引 + 布局适配器 + 渲染器注册制。部署和新 API 详见文档三；本次没有启动服务或验证平台网络可达。artifact-browser 仅列入已登记的结果目录，不递归暴露模型权重、日志秘密或代码配置。
-<!-- /module:result_browse -->
-
 <!-- section:execution-guide -->
 ## 入口、共享基础设施与局部重跑
 
 | 意图 | 入口/实际覆盖 | 注意 |
 |---|---|---|
-| 从视频跑基础三级描述 | `mimo_video_pipeline.py`：split-shots → aggregate-global → global-caption → shot-caption → segment-caption → cut-segments | 没有预处理、轨迹、声音增强、物体、场景、人物物化 |
+| 全流程主线一键编排 | `run_full_pipeline.py --input-dir <目录> --asr-dir <ASR 目录>` | 切镜→聚合→全局描述(说话归属)→镜头描述→固定段规划→片段描述→切段→轨迹→全局归属→声音候选→物化→物体候选→物体定位分割+参考集→场景参考图，共 15 阶段，全部为最新逻辑（speaker_v2 / shot_v3 / fixed_segments_v4 / 轨迹构建器 / 全局归属 / 物化器 / grounding_queue_v2 / segmenter_v4 / 场景提取器），不含旧 CHR 链；每视频独立工作区，`pipeline_state.json` 支持断点续跑；ASR/VLM/GPU/ffmpeg 为外部前置，预检缺失会拒绝启动；跑完可 `--update-viewer-config` 并入结果网站 |
+| 从视频跑基础三级描述 | `mimo_video_pipeline.py`：split-shots → aggregate-global → global-caption → shot-caption → segment-caption → cut-segments | 旧版 captioner；没有轨迹、声音、物体、场景、人物物化 |
 | 固定结构的 Scheme A | `mimo_video_pipeline_scheme_a.py`：all 只含 global/shot/fixed-segment 三步描述 | 必须有 ASR 与分段；上游结构和下游物理切段另行运行 |
 | 新人物归属与物化 | `global_align_pipeline/run_global_align_pipeline.sh` 的两步 | 默认路径需覆盖；此 shell 未先自动 dry-run；物化有清目录行为 |
 | 声音增强建模 | `assets/voice/speaker_voice_asset_pipeline.py run` | independent global 音频链，不自动映射 S-ID |
@@ -1315,5 +1323,5 @@ Git HEAD：`0c5ddfd367388461d96bed16fc57e4560a70ace8`。初始工作树有 4 个
 
 本次证据覆盖入口编排、核心算法决策与落盘代码、已有 viewer 的读取/服务逻辑、代表 JSON/JSONL 和目录结构。没有验证模型端点可用性、GPU 运行、全量媒体内容、所有历史脚本组合、实际代理连通性或语义标注准确率。所有设计指标均留在文档三，不能反过来当作当前系统验收结果。
 
-内容更新记录：`1.0.0 / 2026-09-18`，建立 27 个业务模块的统一说明及网站读取元数据，区分现有实现、外部结果、兼容分支和待建展示层。
+内容更新记录：`1.3.0 / 2026-09-21`，展示瘦身：主线收敛为与 run_full_pipeline.py 15 阶段编排对应的 15 个模块，source_prepare、generation_bundle、i2i_review、tts_review、result_browse 移入文末“支线、扩展与外部模块”章节与最末分组（移动而非删除）；默认路线与总览图同步。`1.2.0 / 2026-09-21`，新增全流程主线一键编排入口 run_full_pipeline.py（15 阶段、最新逻辑、断点续跑、可并入结果网站），入口表与主线路线说明同步。`1.1.0 / 2026-09-20`，主线/支线重排：主线模块（视频结构、内容理解、人物资产、物体、场景、生成对比、结果服务）前置并按流程重编号；旧 CHR 人物链、声音增强建模与兼容支路移入文末“支线与历史兼容模块”章节与最末分组；总览图改为只画主线。模块事实、依赖与产物契约未变。`1.0.0 / 2026-09-18`，建立 27 个业务模块的统一说明及网站读取元数据，区分现有实现、外部结果、兼容分支和待建展示层。
 <!-- /section:evidence-baseline -->
