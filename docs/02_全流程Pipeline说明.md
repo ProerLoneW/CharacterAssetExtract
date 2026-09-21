@@ -9,7 +9,7 @@
 {
   "doc_id": "extract-full-pipeline",
   "schema_version": "1.0.0",
-  "content_version": "1.3.0",
+  "content_version": "1.4.0",
   "updated_at": "2026-09-21",
   "title": "视频理解与资产提取系统",
   "summary": "从视频结构和语义描述出发，形成可追溯的人物、声音、物体、场景资产及生成效果对比。",
@@ -28,7 +28,7 @@
     {"id":"compatibility","title":"支线与扩展模块","order":80}
   ],
   "routes": [
-    {"id":"fixed-global-align","title":"固定分段与全局人物归属","modules":["shot_split","global_group","segment_plan","asr_timeline","global_describe","shot_describe","segment_describe","segment_export","person_tracks","person_align","voice_preview","character_pack","object_queue","object_ground","scene_select"],"description":"主要讲解路径，与 run_full_pipeline.py 的 15 阶段编排一一对应（外部 ASR 为输入）；扩展与支线模块见文末章节。"},
+    {"id":"fixed-global-align","title":"固定分段与全局人物归属","modules":["shot_split","global_group","segment_plan","asr_timeline","global_describe","shot_describe","segment_describe","segment_export","person_tracks","person_align","voice_preview","character_pack","object_queue","object_ground","scene_select"],"description":"主要讲解路径，与 run_full_pipeline.py 的 15 阶段编排一一对应（外部 ASR 为输入）；编排默认先执行统一降采样阶段（normalize_video，--no-normalize 可关），产物属于 source_prepare 模块。扩展与支线模块见文末章节。"},
     {"id":"basic-caption","title":"基础三级描述","modules":["source_prepare","shot_split","global_group","global_describe","shot_describe","segment_describe","segment_export"],"description":"mimo_video_pipeline.py 的六步编排；global 不含 Scheme A 的权威 ASR 归属，segment 由模型在边界约束下组织。"},
     {"id":"legacy-chr","title":"CHR 聚类与角色映射","modules":["source_prepare","shot_split","global_group","segment_plan","asr_timeline","global_describe","shot_describe","segment_describe","person_tracks","legacy_refine","legacy_identity","legacy_gallery","voice_model","voice_preview","legacy_bind"],"description":"保留逐镜头语义筛选、跨镜头身份图、CHR 画廊、投票绑定，用于兼容和对照。"},
     {"id":"audio-evidence","title":"前景声音与身份验证","modules":["source_prepare","shot_split","global_group","voice_model"],"description":"可独立运行；得到 SPK 身份和净语音证据，不自动得到视觉 S-ID。"}
@@ -137,7 +137,7 @@ movie_full_pipeline_20260916/
 
 ### 输入与前置条件
 
-消费 source_video；模型检测需要相应依赖和权重，视频导出需要 ffmpeg。导出目录是否追加 `<video>/` 由 `--flat` 决定。不要把 CLI 输出根和最终清单目录混为一谈。
+消费 source_video；模型检测需要相应依赖和权重，视频导出需要 ffmpeg。TransNetV2 权重默认是集群绝对路径，可经 `TRANSNET_MODEL_PATH`/`TRANSNET_SOURCE_DIR` 环境变量覆盖；`auto` 因权重缺失回落 PySceneDetect 时会打 WARNING，两种检测器的切镜结果口径不可比。导出目录是否追加 `<video>/` 由 `--flat` 决定。不要把 CLI 输出根和最终清单目录混为一谈。
 
 ### 处理过程
 
@@ -175,15 +175,17 @@ movie_full_pipeline_20260916/
 
 ### 作用与判断
 
-global 给人物命名和长程事件理解提供上下文。默认 SCRL 场景检测，另可选 metadata/none/auto；算法在场景分组内按目标长度聚合。
+global 给人物命名和长程事件理解提供上下文。场景检测可选 `scrl`（学习式 BiLSTM 边界）、`semsim`（免训练语义边界）、`metadata`、`none` 与 `auto`；算法在场景分组内按目标长度聚合。
 
 ### 输入与前置条件
 
-消费 shots 清单，镜头视频和源视频应可读。SCRL 使用本地权重及 vendored 代码；失效行为以实际选择的 detector 分支为准，不把“可选 auto”写成所有模式都静默降级。
+消费 shots 清单，镜头视频和源视频应可读。SCRL 使用本地权重及 vendored 代码，权重路径可用 `SCRL_ENCODER_PATH`/`SCRL_BOUNDARY_PATH` 环境变量覆盖；semsim 复用场景链的本地 DINOv3 目录（`--semsim-model`，默认 `local_models/dinov3-vitl16`，可用 `SEMSIM_DINO_MODEL` 覆盖）。镜头 clip 缺失（如上游 `--no-export`）时场景检测回退到按源视频绝对时间采样，clip 与源片都不可读才报错。
 
 ### 处理过程
 
-读取 shots → 可选场景分组 → 默认 min/target/max 为 60/90/120 秒进行镜头分组 → 优先从源视频区间切出 global；不能使用源片时可拼接镜头。镜头完整性、场景边界和尾段可能导致长度偏离目标，页面应展示实际长度。
+读取 shots → 场景分组 → 默认 min/target/max 为 60/90/120 秒进行镜头分组 → 优先从源视频区间切出 global；不能使用源片时可拼接镜头。镜头完整性、场景边界和尾段可能导致长度偏离目标，页面应展示实际长度。
+
+`auto` 的回落顺序为 SCRL → semsim → metadata，每级回落打 WARNING。semsim 是 2026-09-21 新增的免训练检测器：每镜头按时长自适应采样（约每 2 秒 1 帧、上限 8）算 DINOv3 embedding，边界分数 = 60% 上下文窗口自相似不匹配 + 40% 相邻镜头不相似，可叠加音频响度对比（一次 ffmpeg RMS pass，`--semsim-audio-weight` 默认 0.25）；阈值默认自适应（mean+σ·std），并以 24s/240s 最小/最大场景时长先验贪心接受边界。方法取向为 BaSSL/ShotCoL 上下文自相似 + CMS 音视对比 + 时长正则，未用 LLM、未引入新权重。
 
 ### 产物与消费
 
@@ -191,7 +193,7 @@ global 给人物命名和长程事件理解提供上下文。默认 SCRL 场景�
 
 ### 异常、重跑与成本
 
-SCRL 提特征与重编码影响成本。基础编排同样可能仅因清单存在跳过；改变 global 边界会改变 S-ID 作用域，不能沿用旧角色键。拼接模式还要核对实际视频时间与 manifest 时长一致。
+SCRL 提特征与重编码影响成本；semsim 的成本主要在 DINOv3 逐镜头采样（比 SCRL 的固定 3 帧多，长片差距更大）。基础编排同样可能仅因清单存在跳过；改变 global 边界会改变 S-ID 作用域，不能沿用旧角色键。拼接模式还要核对实际视频时间与 manifest 时长一致。
 
 ### 展示与验收
 
@@ -494,7 +496,7 @@ fixed_v4：投影并冻结上游区间和 shot_ids；要求模型返回的 upstr
   "depends_on":["person_tracks","global_group","global_describe","shot_describe"],"optional_depends_on":["segment_describe"],"inputs":["tracklets","globals","global_captions","shot_captions","segment_captions"],
   "source_refs":["global_align_pipeline/global_tracklet_aligner.py","global_align_pipeline/prompts/global_tracklet_alignment_prompt_en_v1.md","global_align_pipeline/run_global_align_pipeline.sh"],"evidence":["code","sample"],
   "outputs":[
-    {"id":"direct_alignment","title":"全局人物归属清单","kind":"jsonl","paths":{"integrated":["global_alignment/global_tracklet_alignment.jsonl"],"custom":["{output}/global_tracklet_alignment.jsonl"]},"record_key":["global_scope_id"],"timebase":"global_local","schema":"global-tracklet-character-alignment-v1","required":true},
+    {"id":"direct_alignment","title":"全局人物归属清单","kind":"jsonl","paths":{"integrated":["global_alignment/global_tracklet_alignment.jsonl"],"custom":["{output}/global_tracklet_alignment.jsonl"]},"record_key":["global_scope_id"],"timebase":"global_local","schema":"global-tracklet-character-alignment-v2","required":true},
     {"id":"alignment_evidence","title":"归属请求与带框视频","kind":"directory","paths":{"integrated":["global_alignment"],"custom":["{output}"]},"record_key":["global_scope_id"],"timebase":"global_local","schema":"mixed","required":true}
   ],
   "view":{"enabled":true,"renderer":"alignment-evidence","adapter":"global-alignment-v1","filters":["scope","subject","status"],"primary_artifact":"direct_alignment"}
@@ -517,7 +519,7 @@ fixed_v4：投影并冻结上游区间和 shot_ids；要求模型返回的 upstr
 
 ### 产物与消费
 
-`global_tracklet_alignment.jsonl` 每 global 一行；关键字段 `status/tracklet_count/assigned_tracklet_count/tracklet_alignments/missing_alignment_tracklet_ids/unmatched_semantic_subject_ids/quality_issues`。每条归属含 `tracklet_id/subject_id/confidence/importance_tier/visual_cues/reason`。
+`global_tracklet_alignment.jsonl` 每 global 一行；关键字段 `status/tracklet_count/assigned_tracklet_count/entity_nature_counts/tracklet_alignments/missing_alignment_tracklet_ids/unmatched_semantic_subject_ids/quality_issues`。每条归属含 `tracklet_id/subject_id/entity_nature/confidence/importance_tier/visual_cues/reason`。schema 自 v2 起增加 `entity_nature`（real_person/depicted_person/non_person/uncertain，与 S-ID 指派解耦：照片/屏幕/镜面里的人物可保留所指派的 S-ID 但标记 depicted_person；缺失或非法值降级 uncertain 不触发重试），summary 含 `entity_nature_totals`。
 
 还写 `requests/<scope>_package.json`、`stitched/<scope>_tracklets.mp4`、`alignments/<scope>.json`、`summary.json`。行内 `stitched_video` 可能仅有文件名，适配器需按本目录 stitched/ 解析。消费方：角色物化和网页证据检查。
 
@@ -584,8 +586,8 @@ fixed_v4：投影并冻结上游区间和 shot_ids；要求模型返回的 upstr
   "depends_on":["person_align","person_tracks","voice_preview"],"optional_depends_on":[],"inputs":["direct_alignment","tracklets","voice_previews"],
   "source_refs":["global_align_pipeline/global_character_materializer.py"],"evidence":["code","sample"],
   "outputs":[
-    {"id":"characters","title":"角色素材目录","kind":"directory","paths":{"integrated":["characters"],"custom":["{output}/characters"]},"record_key":["semantic_scope_id","subject_id"],"timebase":"none","schema":"global-character-materialization-v1","required":true},
-    {"id":"character_summary","title":"角色物化统计","kind":"json","paths":{"integrated":["materialization_summary.json"],"custom":["{output}/materialization_summary.json"]},"record_key":[],"timebase":"none","schema":"global-character-materialization-v1","required":true}
+    {"id":"characters","title":"角色素材目录","kind":"directory","paths":{"integrated":["characters"],"custom":["{output}/characters"]},"record_key":["semantic_scope_id","subject_id"],"timebase":"none","schema":"global-character-materialization-v2","required":true},
+    {"id":"character_summary","title":"角色物化统计","kind":"json","paths":{"integrated":["materialization_summary.json"],"custom":["{output}/materialization_summary.json"]},"record_key":[],"timebase":"none","schema":"global-character-materialization-v2","required":true}
   ],
   "view":{"enabled":true,"renderer":"character-gallery","adapter":"characters-global-v1","filters":["scope","subject","status"],"primary_artifact":"characters"}
 }
@@ -605,9 +607,11 @@ fixed_v4：投影并冻结上游区间和 shot_ids；要求模型返回的 upstr
 
 当前实现没有排除 new_subject_candidate，会把这一哨兵名称下不同未确认轨迹聚到同一目录。这是“未注册候选集合”，不能被网页渲染为已确认的一个人，也不能把复制的 valid 预览称为已审核净语音。
 
+两个可选守护（2026-09-21，schema 升至 v2）：`--identity-check` 用 Stage3 同款 InsightFace（buffalo_l）对同一 (scope,S-ID) 内各轨迹 top-3 人脸算平均 embedding，两两 cosine 建图（阈值默认 0.40），最大连通分量（MiMo 置信度加权破平）为身份核，核外轨迹判为 outlier——默认仅剔除其 face crop（`--exclude-outlier-visual` 连 body/rgba 一起剔除），结果写 role_character.json 的 identity_check（含相似度矩阵）与根目录 identity_conflicts.json；模型/图片不可用时 fail-open 跳过，全体互不相似标 inconclusive 并保留，1v1 无法判定也进人工复核清单。`entity_nature` 门控：depicted_person/non_person 轨迹不进资产库、只按其指派 S-ID 记录在 role_character.json 的 depicted_references（该 S-ID 只有 depicted 轨迹时不建目录）；uncertain 默认照常物化，`--strict-entity-nature` 收紧。skip_model_call 兜底行无 entity_nature，按 uncertain 处理。
+
 ### 产物与消费
 
-`characters/<scope>/<S-ID>/visual/{face,body,rgba}/`、`voice/valid/`（可选 invalid）、`role_character.json`。后者含 `semantic_scope_id/subject_id/tracklet_count/tracklet_ids/mean_alignment_confidence/visual_stats/voice_stats/source_alignment`；根 materialization_summary 给 character_count、assigned_tracklet_count 和每角色复制数量。消费方：展示、人工挑选和外部生成引用。
+`characters/<scope>/<S-ID>/visual/{face,body,rgba}/`、`voice/valid/`（可选 invalid）、`role_character.json`。后者含 `semantic_scope_id/subject_id/tracklet_count/tracklet_ids/mean_alignment_confidence/entity_nature_counts/depicted_references/identity_check/visual_stats/voice_stats/source_alignment`；根 materialization_summary 给 character_count、assigned_tracklet_count、entity_nature_totals、identity_outlier_tracklet_count 和每角色复制数量，identity_conflicts.json 列出 outlier 与待复核冲突。消费方：展示、人工挑选和外部生成引用。
 
 ### 异常、重跑与成本
 
@@ -734,6 +738,8 @@ GroundingDINO 给文本对象候选框，SAM3.1 按几何提示分割；还要�
 
 `aux_selection=marginal` 的辅助选择关注对已选集合的边际收益，保留 selection_strategy/max_sim_to_selected 等额外字段；与默认版本分开输出，不能把“优化”目录名称当提升质量的证明。
 
+2026-09-21 新增三个 opt-in 选项（默认行为不变）：`--shots-manifest` 传入 shots 清单后采样时间戳吸附最近镜头边界（±0.6s，吸附计数写入 run_manifest）；`--max-scenes auto` 在 2..12 网格上按 cosine silhouette 自动定场景数（各 k 分数写入 scene_index 的 scene_discovery.selection）；`--anchor-selection coverage` 用 k-center 贪心（facility-location 次模覆盖的贪婪近似）选主/辅锚点以保证视角多样性，会覆盖 aux 选择策略。三项均未在服务器实测。
+
 ### 产物与消费
 
 根 `run_manifest.json`；每 `<video>/` 下 `scene_index.json/candidate_scores.json/all_scenes_preview.jpg`；每 `scene_NNN/` 下 `scene_meta.json/anchor_main.jpg/anchor_aux_*.jpg/person_mask_main.png/anchor_main_debug.jpg/topk_preview.jpg`。index 的 scenes 含 sample_count、returned_frame_count、relation_constraint_satisfied、selected 的时间/分数/人物占比。消费方为 I2I 场景包和场景浏览。
@@ -764,12 +770,14 @@ GPU 特征提取与检测是主要成本；仅改变选帧策略是否能复用�
 ```json pipeline-module
 {
   "id":"source_prepare","title":"输入与预处理","order":160,"group":"compatibility","lifecycle":"optional","implementation":"existing",
-  "summary":"确认源视频及时间坐标，按需移除片头片尾低内容区间。",
+  "summary":"确认源视频及时间坐标，按需统一降采样、移除片头片尾低内容区间。",
   "depends_on":[],"optional_depends_on":[],"inputs":[],
-  "source_refs":["preprocessing/preprocess.py"],"evidence":["code"],
+  "source_refs":["preprocessing/preprocess.py","preprocessing/normalize_video.py","run_full_pipeline.py"],"evidence":["code"],
   "outputs":[
     {"id":"source_video","title":"切镜输入视频","kind":"media","paths":{"custom":["{source_video}"]},"record_key":[],"timebase":"source","schema":"unversioned","required":true},
-    {"id":"preprocess_info","title":"预处理区间报告","kind":"json","paths":{"custom":["{output}/processed_info.json"]},"record_key":[],"timebase":"source","schema":"unversioned","required":false}
+    {"id":"preprocess_info","title":"预处理区间报告","kind":"json","paths":{"custom":["{output}/processed_info.json"]},"record_key":[],"timebase":"source","schema":"unversioned","required":false},
+    {"id":"normalized_video","title":"统一降采样视频","kind":"media","paths":{"custom":["{output}/normalized/normalized.mp4"]},"record_key":[],"timebase":"source","schema":"unversioned","required":false},
+    {"id":"normalize_info","title":"降采样参数报告","kind":"json","paths":{"custom":["{output}/normalized/normalized.mp4.info.json"]},"record_key":[],"timebase":"none","schema":"unversioned","required":false}
   ],
   "view":{"enabled":true,"renderer":"source-overview","adapter":"source-v1","filters":[],"primary_artifact":"source_video"}
 }
@@ -779,9 +787,11 @@ GPU 特征提取与检测是主要成本；仅改变选帧策略是否能复用�
 
 输入登记是概念上的必需步骤，执行裁剪是可选动作。`preprocessing/preprocess.py` 用低亮度、低音量和相邻采样帧平均亮度变化判断候选丢弃区间；它不是语义片头/字幕识别器，静态剧情也可能被命中。
 
+2026-09-21 新增统一降采样：`preprocessing/normalize_video.py`（`scale=-2:480,fps=15`、crf 20、aac 128k，写 `<output>.info.json` 记录输入/输出探测参数与命令行）。run_full_pipeline 编排默认把它作为第一阶段 `normalize_video`（`--no-normalize` 关闭、`--norm-height/--norm-fps` 可调），切镜与场景提取改吃 normalized.mp4；目的在于进入 MiMo 标注与检测前统一分辨率/帧率、显著缩小请求与推理成本。
+
 ### 输入与前置条件
 
-输入本地视频，依赖 ffmpeg/ffprobe、numpy。先确认视频/音轨可读取，以及后续究竟使用原片还是处理后视频。当前两套 caption 编排的 `all` 都不会自动执行这里。
+输入本地视频，依赖 ffmpeg/ffprobe、numpy。先确认视频/音轨可读取，以及后续究竟使用原片还是处理后视频。裁剪链不会被两套 caption 编排的 `all` 自动执行；降采样链只被 run_full_pipeline 默认执行（基础六步编排仍直接吃原片）。
 
 ### 处理过程
 
@@ -789,7 +799,7 @@ GPU 特征提取与检测是主要成本；仅改变选帧策略是否能复用�
 
 ### 产物与消费
 
-`processed_info.json` 记录 `source/duration_sec/trimmed_sec/kept_intervals/drops/processed_video`；处理视频路径以 `processed_video` 为准。没有裁剪时可直接引用原片。`source_video` 被切镜模块消费；区间报告用于原片与处理后时间互译及网页解释。
+`processed_info.json` 记录 `source/duration_sec/trimmed_sec/kept_intervals/drops/processed_video`；处理视频路径以 `processed_video` 为准。没有裁剪时可直接引用原片。`source_video` 被切镜模块消费；区间报告用于原片与处理后时间互译及网页解释。降采样链产出 `normalized/normalized.mp4` 与同名 `.info.json`（输入/输出宽高、fps、时长、完整命令行），被 run_full_pipeline 的切镜与场景阶段消费；注意降采样改变帧率后 shot 的 `frame_range` 语义随 normalized 时间轴变化，与原片帧号不可混用。
 
 ### 异常、重跑与成本
 
@@ -988,6 +998,8 @@ API 包括 `/api/workspaces`、`/api/stages`、`/api/entities`、`/api/character
 前景人声分离 → 重叠检测 → 在前景 stem 上建立 speech windows、局部 speaker tracklets 和 turn → CAM++ 身份特征/约束聚类 → foreground gate → 收集 speaker pools、合并证据 → 排除 simultaneous speech → 生成 consolidated 参考和审计。可选双路径验证比较增强声轨与原混音的身份；默认 shadow 记录与启用 enforce 拒绝是不同语义。
 
 当前未提交的 builder 已用 CocktailASR 替换原 Transcriber，默认模型路径改为 `local_models/Xiaomi-CocktailASR-1`。自动参考属于目标说话人转写，不能证明覆盖所有人；需显式时间分段/可靠 ASR 输入，才能支撑句级音频。保留 `--asr-json` 的历史参数名称不表示仍运行 Whisper。
+
+2026-09-21 起 `cocktail_asr.py` 提供多参考多说话人转写（官方无多说话人版本，利用目标说话人 ASR 的"目标缺席输出空文本"拒识特性）：`transcribe_multi_speaker`/CLI `--ref S1=path --ref S2=path`（或 `--ref-list`）。共享能量分段时间轴，每条参考音纹跑一遍目标转写，空文本段丢弃，跨说话人按时间 IoU>0.7 且文本前缀相同去重；输出行带 `speaker_id/matched_ref`，另含 dropped_duplicates 与逐参考计数。旧单参考模式行为不变；`test_cocktail_asr.py --via multi` 可验收。参考音纹建议取本链 consolidated registry 的参考音频。重叠语音下的拒识表现未实测。
 
 ### 产物与消费
 
@@ -1293,6 +1305,8 @@ stub 仍可能调用 ffmpeg 抽帧/音频；real 会用 GPU，不能为试网页
 | G13 | 没有统一的 run manifest、输入哈希和跨所有模块的原子发布协议 | 未来索引层提供运行绑定和 provenance；现阶段不能推断产物全部由当前 commit 生成 |
 | G14 | fixed_v4 容许兼容 clip_ids 的数字提取，m04 有派生子 clip | 验证派生 ID 映射，不保证无损直连 |
 | G15 | I2I 导出仍偏旧布局及 role_to_chr，0916 整合布局经过整理 | 需明确 adapter/导出绑定，新链完整接入尚未核验 |
+| G16 | 2026-09-21 五项增强（normalize_video 首阶段、semsim 检测器、场景提取三选项、CocktailASR 多参考多说话人、TransNet/SCRL 权重环境变量）均为仅代码核验，本机无运行环境未实测 | 服务器实验前不得把默认行为变化当作已验证效果；run_full_pipeline 默认开启降采样会改变后续所有产物口径 |
+| G17 | person_align/character_pack schema 已升 v2（entity_nature、identity_check、depicted_references），文档样本仍来自 v1 运行 | 适配器解析 v2 新字段时对 v1 旧样本按缺省 uncertain 处理；新旧运行不能混在一份 characters 里 |
 
 优先级：网站一期先解决 G04/G05/G08 的真实展示、G10 的文档解析、G11 的路径读取、G12 的文档版本管理；业务算法变化是独立开发任务。本文没有据此修改任何实现。
 <!-- /section:known-gaps -->
@@ -1323,5 +1337,5 @@ Git HEAD：`0c5ddfd367388461d96bed16fc57e4560a70ace8`。初始工作树有 4 个
 
 本次证据覆盖入口编排、核心算法决策与落盘代码、已有 viewer 的读取/服务逻辑、代表 JSON/JSONL 和目录结构。没有验证模型端点可用性、GPU 运行、全量媒体内容、所有历史脚本组合、实际代理连通性或语义标注准确率。所有设计指标均留在文档三，不能反过来当作当前系统验收结果。
 
-内容更新记录：`1.3.0 / 2026-09-21`，展示瘦身：主线收敛为与 run_full_pipeline.py 15 阶段编排对应的 15 个模块，source_prepare、generation_bundle、i2i_review、tts_review、result_browse 移入文末“支线、扩展与外部模块”章节与最末分组（移动而非删除）；默认路线与总览图同步。`1.2.0 / 2026-09-21`，新增全流程主线一键编排入口 run_full_pipeline.py（15 阶段、最新逻辑、断点续跑、可并入结果网站），入口表与主线路线说明同步。`1.1.0 / 2026-09-20`，主线/支线重排：主线模块（视频结构、内容理解、人物资产、物体、场景、生成对比、结果服务）前置并按流程重编号；旧 CHR 人物链、声音增强建模与兼容支路移入文末“支线与历史兼容模块”章节与最末分组；总览图改为只画主线。模块事实、依赖与产物契约未变。`1.0.0 / 2026-09-18`，建立 27 个业务模块的统一说明及网站读取元数据，区分现有实现、外部结果、兼容分支和待建展示层。
+内容更新记录：`1.4.0 / 2026-09-21`，登记五项未运行验证的代码增强：统一降采样阶段（source_prepare 新增 normalize_video 产物与 run_full_pipeline 默认首阶段）、global_group 的 semsim 免训练检测器与 auto 回落顺序/环境变量/--no-export 容忍、scene_select 三个 opt-in 选项、voice_model 的 CocktailASR 多参考多说话人、person_align/character_pack schema v2（entity_nature/identity_check/depicted_references，此三项为更早会话实现、本次补登记）；已知差异新增 G16/G17。`1.3.0 / 2026-09-21`，展示瘦身：主线收敛为与 run_full_pipeline.py 15 阶段编排对应的 15 个模块，source_prepare、generation_bundle、i2i_review、tts_review、result_browse 移入文末“支线、扩展与外部模块”章节与最末分组（移动而非删除）；默认路线与总览图同步。`1.2.0 / 2026-09-21`，新增全流程主线一键编排入口 run_full_pipeline.py（15 阶段、最新逻辑、断点续跑、可并入结果网站），入口表与主线路线说明同步。`1.1.0 / 2026-09-20`，主线/支线重排：主线模块（视频结构、内容理解、人物资产、物体、场景、生成对比、结果服务）前置并按流程重编号；旧 CHR 人物链、声音增强建模与兼容支路移入文末“支线与历史兼容模块”章节与最末分组；总览图改为只画主线。模块事实、依赖与产物契约未变。`1.0.0 / 2026-09-18`，建立 27 个业务模块的统一说明及网站读取元数据，区分现有实现、外部结果、兼容分支和待建展示层。
 <!-- /section:evidence-baseline -->

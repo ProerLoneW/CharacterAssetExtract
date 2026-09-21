@@ -104,6 +104,14 @@ DEFAULT_WEIGHTS = {
     "parallax": 0.02,
 }
 
+# Optional shot-manifest alignment snaps sampled timestamps onto the union of
+# every t0/t1 boundary found in shots.jsonl.
+SHOT_SNAP_TOLERANCE_SEC = 0.6
+# --max-scenes auto searches this inclusive k grid by mean cosine silhouette.
+AUTO_SCENE_GRID = range(2, 13)
+# Silhouette is evaluated on at most this many embeddings for speed.
+SILHOUETTE_SAMPLE_LIMIT = 2000
+
 
 @dataclass
 class Detection:
@@ -530,8 +538,105 @@ class Dinov3SceneEmbedder:
         return matrix
 
 
+def _load_shot_boundaries(path: Path) -> list[float]:
+    """Read a shots.jsonl manifest into a sorted unique boundary list.
+
+    Every non-empty line must be a JSON object carrying
+    ``time_range_sec: [t0, t1]``; both endpoints of each shot join the
+    boundary set that sampled timestamps may snap onto.
+    """
+    if not path.is_file():
+        raise FileNotFoundError(f"shots manifest does not exist: {path}")
+    boundaries: set[float] = set()
+    with path.open("r", encoding="utf-8") as handle:
+        for line_number, line in enumerate(handle, 1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                record = json.loads(stripped)
+                start_sec, end_sec = record["time_range_sec"]
+                boundaries.add(float(start_sec))
+                boundaries.add(float(end_sec))
+            except (json.JSONDecodeError, KeyError, TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"invalid shots manifest line {line_number} in {path}: {stripped}"
+                ) from exc
+    if not boundaries:
+        raise ValueError(f"shots manifest contains no time_range_sec entries: {path}")
+    return sorted(boundaries)
+
+
+def _align_samples_to_shots(
+    frame_positions: np.ndarray,
+    boundaries: Sequence[float],
+    tolerance_sec: float,
+    fps: float,
+    frame_count: int,
+    desired: int,
+) -> tuple[np.ndarray, int]:
+    """Snap sample positions (in frames) onto the closest shot boundary.
+
+    ``boundaries`` must be sorted ascending (as returned by
+    ``_load_shot_boundaries``).  A sample moves only when the nearest
+    boundary lies within ``tolerance_sec``; otherwise it keeps its original
+    timestamp.  Samples collapsing onto one boundary are deduplicated and
+    the pool is topped back up towards ``desired`` with the nearest unused
+    in-range boundaries, so alignment can never push the candidate count
+    below the min/max-candidate target while spare boundaries remain.
+    """
+
+    def clamp_index(position: float) -> int:
+        return max(0, min(frame_count - 1, int(round(position))))
+
+    boundary_positions = np.asarray([value * fps for value in boundaries], dtype=np.float64)
+    requested = [float(value) for value in frame_positions]
+    kept: list[float] = []
+    used: set[int] = set()
+    snapped_count = 0
+    for position in requested:
+        insert = int(np.searchsorted(boundary_positions, position))
+        nearest: float | None = None
+        if insert > 0:
+            nearest = float(boundary_positions[insert - 1])
+        if insert < boundary_positions.size:
+            upper = float(boundary_positions[insert])
+            if nearest is None or abs(upper - position) < abs(nearest - position):
+                nearest = upper
+        if nearest is not None and abs(nearest - position) <= tolerance_sec * fps:
+            position = nearest
+            snapped_count += 1
+        index = clamp_index(position)
+        if index in used:
+            continue
+        used.add(index)
+        kept.append(position)
+    if len(kept) < desired:
+        spare = sorted(
+            (
+                float(value) * fps
+                for value in boundaries
+                if 0.0 <= value * fps <= frame_count - 1
+            ),
+            key=lambda item: min(abs(item - old) for old in requested),
+        )
+        for position in spare:
+            index = clamp_index(position)
+            if index in used:
+                continue
+            used.add(index)
+            kept.append(position)
+            if len(kept) >= desired:
+                break
+    return np.asarray(sorted(kept), dtype=np.float64), snapped_count
+
+
 def _sample_video(
-    video_path: Path, sample_interval: float, min_candidates: int, max_candidates: int
+    video_path: Path,
+    sample_interval: float,
+    min_candidates: int,
+    max_candidates: int,
+    shot_boundaries: Sequence[float] | None = None,
 ) -> tuple[list[Candidate], dict[str, Any]]:
     capture = cv2.VideoCapture(str(video_path))
     if not capture.isOpened():
@@ -548,10 +653,23 @@ def _sample_video(
     start, end = margin, max(margin, duration - margin)
     desired = max(min_candidates, int(math.ceil(max(0.0, end - start) / sample_interval)) + 1)
     desired = max(1, min(max_candidates, desired, frame_count))
+    frame_positions = np.linspace(start * fps, end * fps, desired)
+    snapped_count = 0
+    if shot_boundaries is not None:
+        # Flag-gated alignment to externally provided shot boundaries; the
+        # default path feeds the raw linspace samples to the decoder below.
+        frame_positions, snapped_count = _align_samples_to_shots(
+            frame_positions,
+            shot_boundaries,
+            SHOT_SNAP_TOLERANCE_SEC,
+            fps,
+            frame_count,
+            desired,
+        )
     frame_indices = sorted(
         {
             max(0, min(frame_count - 1, int(round(value))))
-            for value in np.linspace(start * fps, end * fps, desired)
+            for value in frame_positions
         }
     )
     candidates: list[Candidate] = []
@@ -585,7 +703,7 @@ def _sample_video(
     capture.release()
     if not candidates:
         raise RuntimeError(f"failed to decode candidate frames: {video_path}")
-    return candidates, {
+    video_info: dict[str, Any] = {
         "fps": round(fps, 6),
         "frame_count": frame_count,
         "duration_sec": round(duration, 6),
@@ -594,6 +712,11 @@ def _sample_video(
         "candidate_count": len(candidates),
         "sampling_margin_sec": round(margin, 6),
     }
+    if shot_boundaries is not None:
+        video_info["shot_boundary_count"] = len(shot_boundaries)
+        video_info["snap_tolerance_sec"] = SHOT_SNAP_TOLERANCE_SEC
+        video_info["snapped_timestamp_count"] = snapped_count
+    return candidates, video_info
 
 
 def _measure_candidates(candidates: list[Candidate], weights: dict[str, float]) -> None:
@@ -719,35 +842,112 @@ def _measure_candidates(candidates: list[Candidate], weights: dict[str, float]) 
         )
 
 
+def _fit_scene_labels(
+    embeddings: np.ndarray, n_clusters: int | None, distance_threshold: float | None
+) -> np.ndarray:
+    """Average-linkage cosine agglomerative clustering labels.
+
+    Exactly one of ``n_clusters`` / ``distance_threshold`` drives the stop
+    criterion; they mirror the mutually exclusive scikit-learn parameters,
+    so the default threshold path and the ``--max-scenes auto`` grid path
+    share one fitter.
+    """
+    try:
+        from sklearn.cluster import AgglomerativeClustering
+    except ImportError as exc:
+        raise RuntimeError("scikit-learn is required for scene clustering") from exc
+    kwargs: dict[str, Any] = {"linkage": "average"}
+    if n_clusters is not None:
+        kwargs["n_clusters"] = n_clusters
+    else:
+        kwargs["n_clusters"] = None
+        kwargs["distance_threshold"] = distance_threshold
+    try:
+        return AgglomerativeClustering(metric="cosine", **kwargs).fit_predict(embeddings)
+    except TypeError:  # scikit-learn < 1.2
+        return AgglomerativeClustering(affinity="cosine", **kwargs).fit_predict(embeddings)
+
+
+def _choose_auto_scene_count(
+    embeddings: np.ndarray,
+) -> tuple[int | None, dict[str, Any] | None]:
+    """Pick the cluster count on the 2..12 grid by mean cosine silhouette.
+
+    ``--max-scenes auto`` path only: every k is fitted with the same
+    average-linkage cosine clustering used elsewhere and scored with
+    ``silhouette_score`` on the very embeddings that feed the clustering,
+    deterministically subsampled to at most ``SILHOUETTE_SAMPLE_LIMIT`` rows
+    (evenly spaced, no RNG) when the pool is large.  Ties keep the smaller k
+    so equally good scores resolve to fewer, coarser scenes.  Returns
+    ``None`` when fewer than three candidates exist; the caller then falls
+    back to the threshold-driven default clustering.
+    """
+    try:
+        from sklearn.metrics import silhouette_score
+    except ImportError as exc:
+        raise RuntimeError("scikit-learn is required for --max-scenes auto") from exc
+    count = len(embeddings)
+    grid = [k for k in AUTO_SCENE_GRID if k < count]
+    if not grid:
+        return None, None
+    if count > SILHOUETTE_SAMPLE_LIMIT:
+        sample_indices = np.unique(
+            np.linspace(0, count - 1, SILHOUETTE_SAMPLE_LIMIT).round().astype(np.int64)
+        )
+        silhouette_embeddings = embeddings[sample_indices]
+    else:
+        sample_indices = None
+        silhouette_embeddings = embeddings
+    silhouette_by_k: dict[int, float] = {}
+    for k in grid:
+        labels = _fit_scene_labels(embeddings, k, None)
+        if sample_indices is None:
+            score = silhouette_score(embeddings, labels, metric="cosine")
+        else:
+            score = silhouette_score(
+                silhouette_embeddings, labels[sample_indices], metric="cosine"
+            )
+        silhouette_by_k[k] = round(float(score), 6)
+    # Ascending grid + max() keeps the first maximum, so equal rounded
+    # scores resolve to the smaller k.
+    best_k = max(grid, key=lambda value: silhouette_by_k[value])
+    selection = {
+        "mode": "auto",
+        "criterion": "mean cosine silhouette over the clustering embeddings",
+        "search_grid": grid,
+        "silhouette_sample_count": int(len(silhouette_embeddings)),
+        "silhouette_by_k": {str(value): silhouette_by_k[value] for value in grid},
+        "selected_k": best_k,
+    }
+    return best_k, selection
+
+
 def _cluster_scenes(
     candidates: list[Candidate],
     embeddings: np.ndarray,
     scene_similarity: float,
     min_scene_frames: int,
     min_scene_quality: float,
-    max_scenes: int,
-) -> tuple[list[SceneCluster], list[SceneCluster]]:
+    max_scenes: int | str,
+) -> tuple[list[SceneCluster], list[SceneCluster], dict[str, Any] | None]:
     """Cluster recurring visual environments; no cut detection is involved."""
+    selection: dict[str, Any] | None = None
+    resolved_max_scenes: int | None = None if max_scenes == "auto" else max_scenes
     if len(candidates) == 1:
         labels = np.zeros(1, dtype=np.int32)
     else:
-        try:
-            from sklearn.cluster import AgglomerativeClustering
-        except ImportError as exc:
-            raise RuntimeError("scikit-learn is required for scene clustering") from exc
-        kwargs = {
-            "n_clusters": None,
-            "linkage": "average",
-            "distance_threshold": 1.0 - scene_similarity,
-        }
-        try:
-            labels = AgglomerativeClustering(metric="cosine", **kwargs).fit_predict(
-                embeddings
+        if max_scenes == "auto":
+            # Grid path: silhouette picks k, then the final partition is the
+            # n_clusters=best_k fit.  An empty grid (very small pool) keeps
+            # the threshold-driven default, hence the None fallback below.
+            resolved_max_scenes, selection = _choose_auto_scene_count(embeddings)
+            labels = _fit_scene_labels(
+                embeddings,
+                resolved_max_scenes,
+                None if resolved_max_scenes is not None else 1.0 - scene_similarity,
             )
-        except TypeError:  # scikit-learn < 1.2
-            labels = AgglomerativeClustering(affinity="cosine", **kwargs).fit_predict(
-                embeddings
-            )
+        else:
+            labels = _fit_scene_labels(embeddings, None, 1.0 - scene_similarity)
 
     raw: list[tuple[list[Candidate], np.ndarray]] = []
     for label in sorted(set(int(value) for value in labels)):
@@ -800,9 +1000,9 @@ def _cluster_scenes(
         eligible = [max(clusters, key=lambda item: item.importance_score)]
     important = sorted(
         eligible, key=lambda item: item.importance_score, reverse=True
-    )[:max_scenes]
+    )[:resolved_max_scenes]
     important.sort(key=lambda item: min(member.timestamp_sec for member in item.members))
-    return clusters, important
+    return clusters, important, selection
 
 
 def _select_scene_frames(
@@ -811,6 +1011,7 @@ def _select_scene_frames(
     minimum_gap_sec: float,
     aux_similarity: float,
     aux_selection: str = "legacy",
+    anchor_selection: str = "topk",
     max_aux_similarity: float = 0.95,
     aux_min_score: float = 0.15,
 ) -> list[Candidate]:
@@ -856,7 +1057,17 @@ def _select_scene_frames(
             + 0.05 * _clip01(appearance_change * 8.0)
         )
 
-    if aux_selection == "marginal":
+    if anchor_selection == "coverage":
+        # Coverage overrides the aux policy; --aux-selection only governs
+        # the default topk mode.
+        _select_aux_coverage(
+            cluster,
+            selected,
+            remaining,
+            frames_per_scene,
+            minimum_gap_sec,
+        )
+    elif aux_selection == "marginal":
         _select_aux_marginal(
             cluster,
             selected,
@@ -955,6 +1166,54 @@ def _select_aux_marginal(
                 )
             selected.append(chosen)
             pool.remove(chosen)
+
+
+def _select_aux_coverage(
+    cluster: SceneCluster,
+    selected: list[Candidate],
+    remaining: list[Candidate],
+    frames_per_scene: int,
+    minimum_gap_sec: float,
+) -> None:
+    """k-center greedy aux anchors for viewpoint/composition coverage.
+
+    ``--anchor-selection coverage`` path only.  This is the standard
+    farthest-point traversal, i.e. the greedy approximation of the
+    submodular facility-location coverage objective over same-cluster
+    DINOv3 cosine distances: after the unchanged quality-best main seed,
+    every next anchor is the candidate whose *closest* already-selected
+    anchor lies the farthest away, so each pick adds the largest amount of
+    uncovered viewing geometry instead of the next-best near-duplicate.
+    ``remaining`` arrives already gated by the aux-to-main similarity floor,
+    and temporal spacing stays a soft preference (spaced candidates first,
+    whole pool as fallback), so coverage never returns near-duplicate
+    timestamps or off-scene frames.  Trade-off vs topk: aux slots ignore
+    total_score, so a rare but blurrier view can beat a sharper duplicate;
+    the main anchor still follows the unchanged quality rule.
+    """
+
+    def min_distance_to_selected(item: Candidate) -> float:
+        return min(
+            1.0 - _cosine(item.dino_embedding, old.dino_embedding) for old in selected
+        )
+
+    target = min(frames_per_scene, len(cluster.members))
+    while remaining and len(selected) < target:
+        spaced = [
+            item
+            for item in remaining
+            if all(
+                abs(item.timestamp_sec - old.timestamp_sec) >= minimum_gap_sec
+                for old in selected
+            )
+        ]
+        pool = spaced or remaining
+        chosen = max(pool, key=min_distance_to_selected)
+        distance = min_distance_to_selected(chosen)
+        chosen.selection_score = round(distance, 6)
+        chosen.max_sim_to_selected = round(1.0 - distance, 6)
+        selected.append(chosen)
+        remaining.remove(chosen)
 
 
 def _debug_overlay(candidate: Candidate) -> np.ndarray:
@@ -1074,6 +1333,7 @@ def _process_video(
     detector: YoloSceneDetector,
     embedder: Dinov3SceneEmbedder,
     args: argparse.Namespace,
+    shot_boundaries: Sequence[float] | None = None,
 ) -> dict[str, Any]:
     started = time.time()
     output_dir = output_root / video_path.stem
@@ -1086,7 +1346,11 @@ def _process_video(
     output_dir.mkdir(parents=True, exist_ok=True)
 
     candidates, video_info = _sample_video(
-        video_path, args.sample_interval, args.min_candidates, args.max_candidates
+        video_path,
+        args.sample_interval,
+        args.min_candidates,
+        args.max_candidates,
+        shot_boundaries=shot_boundaries,
     )
     # Keep tiled-YOLO memory bounded when a long video reaches hundreds of
     # samples.  DINO already batches internally.
@@ -1096,7 +1360,7 @@ def _process_video(
             candidate.detections = items
     _measure_candidates(candidates, DEFAULT_WEIGHTS)
     embeddings = embedder.embed(candidates)
-    clusters, important = _cluster_scenes(
+    clusters, important, scene_selection = _cluster_scenes(
         candidates,
         embeddings,
         args.scene_similarity,
@@ -1107,6 +1371,9 @@ def _process_video(
     if not important:
         raise RuntimeError(f"no important scene cluster found for {video_path}")
 
+    # Coverage anchor selection overrides the aux policy; topk leaves it alone.
+    aux_strategy = "coverage" if args.anchor_selection == "coverage" else args.aux_selection
+
     scene_records: list[dict[str, Any]] = []
     for scene_number, cluster in enumerate(important, 1):
         selected = _select_scene_frames(
@@ -1115,6 +1382,7 @@ def _process_video(
             args.minimum_gap_sec,
             args.aux_similarity,
             aux_selection=args.aux_selection,
+            anchor_selection=args.anchor_selection,
             max_aux_similarity=args.max_aux_similarity,
             aux_min_score=args.aux_min_score,
         )
@@ -1150,10 +1418,10 @@ def _process_video(
                 "person_area_ratio": item.person_area_ratio,
                 "structure_occlusion_ratio": item.structure_occlusion_ratio,
             }
-            # E1: extra fields only in marginal mode so legacy output stays
-            # byte-identical to the pre-E1 schema.
-            if args.aux_selection == "marginal":
-                record["selection_strategy"] = args.aux_selection
+            # E1/coverage: extra fields only in non-legacy modes so legacy
+            # output stays byte-identical to the pre-E1 schema.
+            if aux_strategy != "legacy":
+                record["selection_strategy"] = aux_strategy
                 record["max_sim_to_selected"] = item.max_sim_to_selected
                 if item.selection_note:
                     record["selection_note"] = item.selection_note
@@ -1225,6 +1493,16 @@ def _process_video(
             "min_candidates": args.min_candidates,
             "max_candidates": args.max_candidates,
             "candidate_count": len(candidates),
+            **(
+                {
+                    "shots_manifest": str(Path(args.shots_manifest).expanduser().resolve()),
+                    "shot_boundary_count": video_info["shot_boundary_count"],
+                    "snap_tolerance_sec": video_info["snap_tolerance_sec"],
+                    "snapped_timestamp_count": video_info["snapped_timestamp_count"],
+                }
+                if args.shots_manifest
+                else {}
+            ),
         },
         "scoring": {
             "weights": DEFAULT_WEIGHTS,
@@ -1247,11 +1525,21 @@ def _process_video(
             "min_scene_frames": args.min_scene_frames,
             "min_scene_quality": args.min_scene_quality,
             "max_scenes": args.max_scenes,
+            **(
+                {"selection": scene_selection}
+                if scene_selection is not None
+                else {}
+            ),
             "returned_scene_count": len(scene_records),
             "frames_per_scene": args.frames_per_scene,
             "minimum_gap_sec": args.minimum_gap_sec,
             "aux_similarity_threshold": args.aux_similarity,
             "relation_policy": "same DINO cluster and direct aux-to-main cosine threshold",
+            **(
+                {"anchor_selection": args.anchor_selection}
+                if args.anchor_selection != "topk"
+                else {}
+            ),
             **(
                 {
                     "aux_selection": args.aux_selection,
@@ -1297,6 +1585,18 @@ def _resolve_videos(args: argparse.Namespace) -> list[Path]:
     return videos
 
 
+def _parse_max_scenes(value: str) -> int | str:
+    """argparse type: a positive integer or the literal ``auto``."""
+    if value == "auto":
+        return "auto"
+    try:
+        return int(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError(
+            f"--max-scenes must be a positive integer or 'auto', got {value!r}"
+        )
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Discover important scenes using local DINOv3 + YOLOv8n; no LLM/VLM/cut detection."
@@ -1322,6 +1622,13 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--sample-interval", type=float, default=1.2)
     parser.add_argument("--min-candidates", type=int, default=12)
     parser.add_argument("--max-candidates", type=int, default=600)
+    parser.add_argument(
+        "--shots-manifest",
+        default=None,
+        help="optional shots.jsonl (one JSON object per line with "
+        "time_range_sec=[t0,t1]); sampled timestamps snap to the nearest "
+        "t0/t1 boundary within 0.6s and collapsed duplicates are merged",
+    )
     parser.add_argument(
         "--scene-similarity",
         type=float,
@@ -1356,6 +1663,15 @@ def build_parser() -> argparse.ArgumentParser:
         help="marginal mode only: minimum total_score for an aux candidate "
         "(relaxed with a selection_note if a scene would otherwise stay short)",
     )
+    parser.add_argument(
+        "--anchor-selection",
+        choices=("topk", "coverage"),
+        default="topk",
+        help="anchor policy: topk keeps the current score-ranked main/aux "
+        "picks; coverage picks aux anchors by k-center greedy over "
+        "same-cluster DINOv3 cosine distance for viewpoint diversity "
+        "(overrides --aux-selection)",
+    )
     parser.add_argument("--min-scene-frames", type=int, default=2)
     parser.add_argument(
         "--min-scene-quality",
@@ -1363,7 +1679,13 @@ def build_parser() -> argparse.ArgumentParser:
         default=0.25,
         help="minimum best-frame usability score for an important scene",
     )
-    parser.add_argument("--max-scenes", type=int, default=12)
+    parser.add_argument(
+        "--max-scenes",
+        type=_parse_max_scenes,
+        default=12,
+        help="maximum important scenes to return, or 'auto' to pick k on the "
+        "2..12 grid by best mean silhouette",
+    )
     parser.add_argument("--frames-per-scene", type=int, default=3)
     parser.add_argument("--minimum-gap-sec", type=float, default=2.0)
     parser.add_argument("--random-count", type=int, default=None)
@@ -1391,7 +1713,9 @@ def _validate_args(args: argparse.Namespace) -> None:
         raise ValueError("--max-aux-similarity must be in (0, 1]")
     if not 0.0 <= args.aux_min_score <= 1.0:
         raise ValueError("--aux-min-score must be in [0, 1]")
-    if args.min_scene_frames <= 0 or args.max_scenes <= 0:
+    if args.min_scene_frames <= 0 or (
+        isinstance(args.max_scenes, int) and args.max_scenes <= 0
+    ):
         raise ValueError("--min-scene-frames and --max-scenes must be positive")
     if not 0.0 <= args.min_scene_quality <= 1.0:
         raise ValueError("--min-scene-quality must be in [0, 1]")
@@ -1405,6 +1729,9 @@ def main() -> int:
     args = build_parser().parse_args()
     _validate_args(args)
     videos = _resolve_videos(args)
+    shot_boundaries: list[float] | None = None
+    if args.shots_manifest:
+        shot_boundaries = _load_shot_boundaries(Path(args.shots_manifest).expanduser())
     output_root = Path(args.output_dir).expanduser().resolve()
     output_root.mkdir(parents=True, exist_ok=True)
     print(f"selected {len(videos)} video(s): {[path.name for path in videos]}")
@@ -1429,7 +1756,14 @@ def main() -> int:
     for index, video in enumerate(videos, 1):
         print(f"[{index}/{len(videos)}] processing {video.name}", flush=True)
         try:
-            report = _process_video(video, output_root, detector, embedder, args)
+            report = _process_video(
+                video,
+                output_root,
+                detector,
+                embedder,
+                args,
+                shot_boundaries=shot_boundaries,
+            )
             reports.append(report)
             main_anchor = report["scenes"][0]["selected"][0]
             print(
@@ -1444,6 +1778,11 @@ def main() -> int:
         "schema_version": "important-scene-run-v2",
         "model_policy": "local DINOv3 + YOLOv8n + OpenCV; no LLM/VLM/remote API/cut detection",
         "seed": args.seed,
+        **(
+            {"shots_manifest": str(Path(args.shots_manifest).expanduser().resolve())}
+            if args.shots_manifest
+            else {}
+        ),
         "requested_videos": [str(path) for path in videos],
         "successful_count": len(reports),
         "failure_count": len(failures),
@@ -1453,6 +1792,16 @@ def main() -> int:
                 "source_video": report["source_video"],
                 "output_dir": report["output_dir"],
                 "scene_count": len(report["scenes"]),
+                **(
+                    {
+                        "shot_boundary_count": report["sampling"]["shot_boundary_count"],
+                        "snapped_timestamp_count": report["sampling"][
+                            "snapped_timestamp_count"
+                        ],
+                    }
+                    if args.shots_manifest
+                    else {}
+                ),
                 "scenes": report["scenes"],
             }
             for report in reports

@@ -7,7 +7,7 @@ This script exercises every public entry point of
 new audio file end-to-end without going through the speaker registry
 pipeline.
 
-It does three things, in this order:
+It does four things, in this order:
 
 1. Builds a 16 kHz mono copy of the input (any wav/flac/mp3 works) and prints
    a one-line summary so you can see what the model is about to transcribe.
@@ -18,11 +18,15 @@ It does three things, in this order:
 3. (Optional) Runs ``transcribe_segments(audio, segments)`` against a tiny
    list of demo segments if you want to confirm the per-turn path that
    ``speaker_registry_builder`` uses once a Stage5 voiceprint is available.
+4. (Optional) Runs ``transcribe_multi_speaker(audio, references)`` with the
+   ``--multi-ref`` voiceprints -- one model pass per speaker over the same
+   energy-gated timeline, then a merged, deduplicated multi-speaker
+   timeline.
 
 Usage
 -----
 
-The script works in three modes:
+The script works in four modes:
 
 A. Just point it at a wav and let it run end-to-end (auto-reference).
 
@@ -40,6 +44,14 @@ C. Use it through the legacy ``speaker_registry_builder.Transcriber`` shim
    to confirm the pipeline integration is intact.
 
        python test_cocktail_asr.py /path/to/audio.wav --via registry
+
+D. Run the multi-speaker approximation with two (or more) reference
+   voiceprints.  Prints per-speaker segment counts and how many
+   cross-speaker duplicates the merger dropped.
+
+       python test_cocktail_asr.py /path/to/mixed.wav --via multi \\
+           --multi-ref A=/path/to/spk_a.wav \\
+           --multi-ref B=/path/to/spk_b.wav --skip-auto
 
 The model weights are read from
 ``local_models/Xiaomi-CocktailASR-1`` by default; override with
@@ -139,6 +151,47 @@ def test_target_speaker(audio_path: Path, ref_audio: Path, segment: tuple[float,
         print(f"[saved] {output_path}")
 
 
+def test_multi_speaker(audio_path: Path, refs: list[tuple[str, Path]],
+                       model_dir: Path, device: str, dtype: str,
+                       output_path: Path | None) -> None:
+    """Run ``CocktailASRTranscriber.transcribe_multi_speaker`` with 2+ refs.
+
+    ``refs`` is a list of ``(speaker_id, ref_audio_path)`` pairs, one per
+    target speaker.  Prints how many segments each reference claimed, how
+    many cross-speaker duplicates the merger dropped, and the final merged
+    timeline.
+    """
+    sys.path.insert(0, str(REPO_ROOT / "assets" / "voice"))
+    from cocktail_asr import CocktailASRTranscriber
+
+    references = [{"speaker_id": speaker_id, "ref_audio": str(path)}
+                  for speaker_id, path in refs]
+    print("\n--- mode: multi-speaker (one pass per reference voiceprint) ---")
+    print(f"[model] {model_dir} (device={device}, dtype={dtype})")
+    for ref in references:
+        print(f"[ref]   {ref['speaker_id']}: {ref['ref_audio']}")
+    transcriber = CocktailASRTranscriber(model_dir=str(model_dir), device=device, dtype=dtype)
+    started = time.perf_counter()
+    payload = transcriber.transcribe_multi_speaker(str(audio_path), references)
+    elapsed = time.perf_counter() - started
+    print(f"[result] {len(payload['segments'])} merged row(s) in {elapsed:.2f}s")
+    for ref in payload["references_used"]:
+        count = payload["per_reference_segment_count"].get(ref["speaker_id"], 0)
+        print(f"[speaker] {ref['speaker_id']}: {count} segment(s)  ({ref['ref_audio']})")
+    print(f"[dedup]   {len(payload['dropped_duplicates'])} cross-speaker "
+          f"duplicate(s) dropped")
+    for row in payload["segments"]:
+        print(f"  [{row['start']:.2f}s - {row['end']:.2f}s] {row['speaker_id']}  "
+              f"conf={row['confidence']:.3f}")
+        print(f"    {row['text']}")
+    for row in payload["dropped_duplicates"]:
+        print(f"  [dropped] {row['speaker_id']} (superseded by "
+              f"{row.get('superseded_by', '?')})  {row['text']}")
+    if output_path is not None:
+        output_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+        print(f"[saved] {output_path}")
+
+
 def test_via_registry_builder(audio_path: Path, model_dir: Path, device: str,
                               compute_type: str, ref_audio: Path | None,
                               segments_json: Path | None,
@@ -176,6 +229,10 @@ def _parse_args() -> argparse.Namespace:
     p.add_argument("--ref", type=Path,
                    help="Reference voiceprint (16 kHz mono).  When provided, runs the "
                         "target-speaker mode in addition to the auto-reference mode.")
+    p.add_argument("--multi-ref", action="append", metavar="SPEAKER_ID=path.wav",
+                   help="One multi-speaker reference voiceprint as SPEAKER_ID=path.wav; "
+                        "repeat the flag once per target speaker (at least two with "
+                        "--via multi).")
     p.add_argument("--segment", nargs=2, type=float, metavar=("START", "END"),
                    help="Optional [start, end] window in seconds for the target-speaker mode. "
                         "Defaults to the whole audio.")
@@ -193,13 +250,27 @@ def _parse_args() -> argparse.Namespace:
                         "--via registry mode to drive per-segment transcription.")
     p.add_argument("--output", type=Path,
                    help="Optional path to dump the ASR rows of the most recent run as JSON.")
-    p.add_argument("--via", choices=["auto", "registry"], default="auto",
+    p.add_argument("--via", choices=["auto", "registry", "multi"], default="auto",
                    help="auto   = call CocktailASRTranscriber directly (default); "
                         "registry = call through the speaker_registry_builder.Transcriber "
-                        "shim so you can confirm the pipeline integration is intact.")
+                        "shim so you can confirm the pipeline integration is intact; "
+                        "multi = call transcribe_multi_speaker once per --multi-ref "
+                        "voiceprint and print the merged, deduplicated timeline.")
     p.add_argument("--skip-auto", action="store_true",
                    help="Skip the always-on auto-reference run.")
     return p.parse_args()
+
+
+def _parse_multi_refs(raw: list[str] | None) -> list[tuple[str, Path]]:
+    """Parse repeatable ``--multi-ref SPEAKER_ID=path.wav`` values."""
+    refs: list[tuple[str, Path]] = []
+    for item in raw or []:
+        speaker_id, sep, path = item.partition("=")
+        speaker_id, path = speaker_id.strip(), path.strip()
+        if not sep or not speaker_id or not path:
+            raise SystemExit(f"--multi-ref expects SPEAKER_ID=path.wav, got: {item}")
+        refs.append((speaker_id, Path(path)))
+    return refs
 
 
 def main() -> int:
@@ -209,6 +280,15 @@ def main() -> int:
     if not args.model_dir.is_dir():
         raise SystemExit(f"model dir not found: {args.model_dir}  "
                          f"-- did the download finish?  ls {args.model_dir}")
+    multi_refs = _parse_multi_refs(args.multi_ref)
+    if args.via == "multi":
+        # Fail fast on the voiceprints before any model pass warms up.
+        if len(multi_refs) < 2:
+            raise SystemExit("--via multi needs at least two --multi-ref "
+                             "SPEAKER_ID=path.wav entries")
+        for speaker_id, path in multi_refs:
+            if not path.is_file():
+                raise SystemExit(f"multi ref audio not found ({speaker_id}): {path}")
 
     _print_audio_summary(args.audio)
 
@@ -227,6 +307,10 @@ def main() -> int:
         test_via_registry_builder(args.audio, args.model_dir, args.device, args.compute_type,
                                   ref_audio=args.ref, segments_json=args.segments_json,
                                   output_path=args.output)
+
+    if args.via == "multi":
+        test_multi_speaker(args.audio, multi_refs, args.model_dir, args.device, args.dtype,
+                           output_path=args.output)
     return 0
 
 

@@ -35,6 +35,7 @@ import argparse
 import importlib.util
 import json
 import logging
+import os
 import subprocess
 import sys
 import types
@@ -49,9 +50,15 @@ VIDEO_EXTENSIONS = {".mp4", ".mov", ".mkv", ".webm", ".avi", ".m4v"}
 # 默认使用本目录下 m02_shots/teleai_src/ 的自包含副本——不 import teleAI-T2V
 # 仓库的任何代码（用户要求：切镜链路必须干净）。模型权重仍在 teleAI-T2V
 # local_models/（保留上游模型所有权）。两者都可用 CLI flag 覆盖。
-DEFAULT_TRANSNET_SOURCE_DIR = Path(__file__).resolve().parent / "m02_shots" / "teleai_src"
+# TRANSNET_SOURCE_DIR / TRANSNET_MODEL_PATH env vars take priority over the code
+# defaults below so the script runs on other machines without CLI changes.
+DEFAULT_TRANSNET_SOURCE_DIR = Path(
+    os.environ.get("TRANSNET_SOURCE_DIR")
+    or (Path(__file__).resolve().parent / "m02_shots" / "teleai_src")
+)
 DEFAULT_TRANSNET_MODEL = Path(
-    "/gemini/platform/public/aigc/lss/Interns/wyn/teleAI-T2V/local_models/transnetv2/"
+    os.environ.get("TRANSNET_MODEL_PATH")
+    or "/gemini/platform/public/aigc/lss/Interns/wyn/teleAI-T2V/local_models/transnetv2/"
     "transnetv2-pytorch-weights.pth"
 )
 LOGGER = logging.getLogger("mimo_shot_splitter")
@@ -306,6 +313,16 @@ def detect_raw_scenes(
     requested = args.detector
     if requested in {"auto", "transnetv2"}:
         can_use_transnet = args.transnet_model is not None and args.transnet_model.is_file()
+        if requested == "auto" and not can_use_transnet:
+            # Loud on purpose: without this warning the fallback is silent and the
+            # shot boundaries quietly stop matching TransNetV2 runs.
+            LOGGER.warning(
+                "TransNetV2 weights unavailable (%s): --detector auto has fallen back to "
+                "adaptive PySceneDetect, and the resulting shot boundaries are NOT "
+                "comparable with TransNetV2 output. Set TRANSNET_MODEL_PATH (or pass "
+                "--transnet-model) to point at the checkpoint.",
+                args.transnet_model,
+            )
         if requested == "transnetv2" or can_use_transnet:
             try:
                 return detect_transnetv2_scenes(

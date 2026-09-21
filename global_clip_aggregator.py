@@ -11,7 +11,8 @@ the audio stream stays continuous across shot boundaries.
 Pipeline::
 
     shots.jsonl
-      -> SCRL scene boundaries (or metadata / none)
+      -> scene boundaries: SCRL (learned BiLSTM) | semsim (training-free
+         DINOv3 context self-similarity + audio contrast) | metadata | none
       -> choose_groups (min/target/max seconds)
       -> export from source video via ffmpeg
       -> global_clips.jsonl
@@ -29,6 +30,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import os
 import subprocess
 import sys
 import tempfile
@@ -38,12 +40,21 @@ from mimo_caption_client import find_shot_manifest, load_jsonl, resolve_clip_pat
 
 # SCRL 代码默认用本目录 m02_shots/teleai_src/others/scrl 的 vendored 副本
 # （不加载 teleAI-T2V 仓库代码）；模型权重仍在 teleAI-T2V/local_models/。
+# 集群默认路径可通过环境变量覆盖（SCRL_ENCODER_PATH / SCRL_BOUNDARY_PATH），
+# 否则新机器上 --scene-detector auto 会响亮回落。
 DEFAULT_SCRL_SOURCE_DIR = Path(__file__).resolve().parent / "m02_shots" / "teleai_src"
 DEFAULT_SCRL_ENCODER = Path(
-    "/gemini/platform/public/aigc/lss/Interns/wyn/teleAI-T2V/local_models/scrl/checkpoint_0099.pth.tar"
+    os.environ.get("SCRL_ENCODER_PATH")
+    or "/gemini/platform/public/aigc/lss/Interns/wyn/teleAI-T2V/local_models/scrl/checkpoint_0099.pth.tar"
 )
 DEFAULT_SCRL_BOUNDARY = Path(
-    "/gemini/platform/public/aigc/lss/Interns/wyn/teleAI-T2V/local_models/scrl/model_best.pth.tar"
+    os.environ.get("SCRL_BOUNDARY_PATH")
+    or "/gemini/platform/public/aigc/lss/Interns/wyn/teleAI-T2V/local_models/scrl/model_best.pth.tar"
+)
+# semsim 检测器复用场景提取链的本地 DINOv3 权重（transformers 目录格式）。
+DEFAULT_SEMSIM_MODEL = Path(
+    os.environ.get("SEMSIM_DINO_MODEL")
+    or Path(__file__).resolve().parent / "local_models" / "dinov3-vitl16"
 )
 LOGGER = logging.getLogger("mimo_global_clip_aggregator")
 
@@ -62,6 +73,20 @@ def find_manifests(input_path: Path) -> list[Path]:
     return manifests
 
 
+def _resolve_source(record: dict, manifest_path: Path) -> Path | None:
+    raw_path = record.get("source_video")
+    if not raw_path:
+        return None
+    path = Path(raw_path)
+    if path.is_file():
+        return path
+    for base in manifest_path.parents:
+        candidate = (base / path).resolve()
+        if candidate.is_file():
+            return candidate
+    return None
+
+
 def load_records(manifest_path: Path) -> list[dict]:
     records = []
     for line_number, line in enumerate(manifest_path.read_text(encoding="utf-8").splitlines(), start=1):
@@ -75,16 +100,23 @@ def load_records(manifest_path: Path) -> list[dict]:
             raise ValueError(f"Manifest record must be an object: {manifest_path}:{line_number}")
         if "shot_id" not in record or "time_range_sec" not in record:
             raise ValueError(f"Missing shot_id/time_range_sec: {manifest_path}:{line_number}")
-        clip_path = record.get("clip_path")
-        if not clip_path:
-            raise ValueError(
-                f"Record has no clip_path; rerun split_shots without --no-export: {manifest_path}:{line_number}"
-            )
-        path = resolve_clip_path(clip_path, manifest_path)
-        if not path.is_file():
-            raise FileNotFoundError(f"Shot clip does not exist: {path}")
         record = dict(record)
-        record["clip_path"] = str(path)
+        clip_path = record.get("clip_path")
+        path = resolve_clip_path(clip_path, manifest_path) if clip_path else None
+        if path is not None and path.is_file():
+            record["clip_path"] = str(path)
+        else:
+            # Tolerate split_shots --no-export: scene detection can sample
+            # frames from the source video instead of the missing clip.
+            source = _resolve_source(record, manifest_path)
+            if source is None:
+                raise ValueError(
+                    f"Record has neither a readable clip_path nor a resolvable source_video "
+                    f"(rerun split_shots without --no-export, or fix source_video): "
+                    f"{manifest_path}:{line_number}"
+                )
+            record["clip_path"] = None
+            record["source_video"] = str(source)
         records.append(record)
     records.sort(key=lambda item: int(item["shot_id"]))
     if not records:
@@ -162,11 +194,11 @@ def resolve_scene_device(requested: str) -> str:
     try:
         import torch
     except ImportError as exc:
-        raise RuntimeError("PyTorch is required for SCRL scene grouping.") from exc
+        raise RuntimeError("PyTorch is required for scene grouping detectors.") from exc
     if requested == "auto":
         return "cuda:0" if torch.cuda.is_available() else "cpu"
     if requested.startswith("cuda") and not torch.cuda.is_available():
-        raise RuntimeError(f"Requested SCRL device {requested}, but CUDA is unavailable.")
+        raise RuntimeError(f"Requested detector device {requested!r}, but CUDA is unavailable.")
     return requested
 
 
@@ -218,23 +250,69 @@ def progress_or_identity(iterable, args: argparse.Namespace, *, total: int, desc
     return tqdm(iterable, total=total, desc=desc, unit=unit, leave=False)
 
 
-def sample_clip_tensor(path: Path, detector: dict):
+def iter_shot_frames(record: dict, fractions: list[float], detector: dict):
+    """Yield BGR frames at given positions (0..1) of a shot.
+
+    Reads the exported shot clip when present; otherwise seeks the source
+    video at the shot's absolute time range (split_shots --no-export mode).
+    """
     cv2 = detector["cv2"]
-    capture = cv2.VideoCapture(str(path))
-    total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
-    if total <= 0:
-        capture.release()
-        raise RuntimeError(f"Unable to read frames from {path}")
-    indices = [min(2, total - 1), total // 2, max(0, total - 10)]
-    frames = []
-    for index in indices:
-        capture.set(cv2.CAP_PROP_POS_FRAMES, index)
-        ok, frame = capture.read()
-        if not ok or frame is None:
+    t0, t1 = (float(value) for value in record["time_range_sec"][:2])
+    clip_path = record.get("clip_path")
+    if clip_path:
+        capture = cv2.VideoCapture(str(clip_path))
+        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        if total <= 0:
             capture.release()
-            raise RuntimeError(f"Unable to sample frame {index} from {path}")
-        frames.append(detector["transform"](cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)))
-    capture.release()
+            raise RuntimeError(f"Unable to read frames from {clip_path}")
+        try:
+            for fraction in fractions:
+                index = min(total - 1, max(0, int(round(fraction * (total - 1)))))
+                capture.set(cv2.CAP_PROP_POS_FRAMES, index)
+                ok, frame = capture.read()
+                if not ok or frame is None:
+                    raise RuntimeError(f"Unable to sample frame {index} from {clip_path}")
+                yield frame
+        finally:
+            capture.release()
+        return
+    source = Path(record["source_video"])
+    capture = cv2.VideoCapture(str(source))
+    try:
+        if not capture.isOpened():
+            raise RuntimeError(f"Unable to open source video {source}")
+        for fraction in fractions:
+            target_sec = t0 + fraction * max(0.0, t1 - t0)
+            capture.set(cv2.CAP_PROP_POS_MSEC, target_sec * 1000.0)
+            ok, frame = capture.read()
+            if not ok or frame is None:
+                # Seek near the end can land past the last decodable frame.
+                capture.set(cv2.CAP_PROP_POS_MSEC, max(0.0, target_sec - 0.2) * 1000.0)
+                ok, frame = capture.read()
+            if not ok or frame is None:
+                raise RuntimeError(f"Unable to sample {target_sec:.2f}s from {source}")
+            yield frame
+    finally:
+        capture.release()
+
+
+def sample_clip_tensor(record: dict, detector: dict):
+    """SCRL 3-frame input, mirroring the original fixed indices (2 / mid / last-10)."""
+    clip_path = record.get("clip_path")
+    if clip_path:
+        cv2 = detector["cv2"]
+        capture = cv2.VideoCapture(str(clip_path))
+        total = int(capture.get(cv2.CAP_PROP_FRAME_COUNT))
+        capture.release()
+        if total > 0:
+            spans = [(index / max(1, total - 1)) for index in
+                     (min(2, total - 1), total // 2, max(0, total - 10))]
+        else:
+            spans = [0.0, 0.5, 1.0]
+    else:
+        spans = [0.05, 0.5, 0.95]
+    frames = [detector["transform"](cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
+              for frame in iter_shot_frames(record, spans, detector)]
     return detector["torch"].cat(frames, dim=0).unsqueeze(0)
 
 
@@ -247,7 +325,7 @@ def scrl_scene_groups(records: list[dict], args: argparse.Namespace) -> list[lis
             records, args, total=len(records), desc="SCRL scene detection", unit="shot"
         )
         for index, record in enumerate(sampled_records, start=1):
-            data = sample_clip_tensor(Path(record["clip_path"]), detector).to(detector["device"])
+            data = sample_clip_tensor(record, detector).to(detector["device"])
             features.append(detector["encoder"](data).detach().cpu())
             if index % 50 == 0:
                 LOGGER.info("SCRL sampled %d/%d shots", index, len(records))
@@ -281,6 +359,217 @@ def scrl_scene_groups(records: list[dict], args: argparse.Namespace) -> list[lis
     return groups
 
 
+# ---------------------------------------------------------------------------
+# semsim scene detector: training-free DINOv3 context self-similarity
+# blended with an audio-energy contrast cue.
+#
+# Grounding (no LLM, no extra training):
+# - context self-similarity for scene boundaries follows the BaSSL
+#   (Mun et al., CVPR 2022) / ShotCoL (Chen et al., 2021) line: a boundary is
+#   where the *context windows* on both sides of a shot stop matching, not
+#   merely where two adjacent shots differ;
+# - the audio-visual contrast cue follows CMS-style multi-modal similarity;
+# - the min/max scene-duration prior follows genre-and-duration-signal scene
+#   segmentation work (long-form video needs duration regularisation).
+# ---------------------------------------------------------------------------
+def load_semsim_embedder(args: argparse.Namespace) -> dict:
+    if not args.semsim_model.is_dir():
+        raise FileNotFoundError(
+            f"semsim DINOv3 model directory not found: {args.semsim_model} "
+            f"(set --semsim-model or SEMSIM_DINO_MODEL)")
+    try:
+        import cv2
+        import torch
+        from transformers import AutoImageProcessor, AutoModel
+    except ImportError as exc:
+        raise RuntimeError("torch/transformers/opencv are required for semsim detection") from exc
+    device = resolve_scene_device(args.semsim_device)
+    processor = AutoImageProcessor.from_pretrained(args.semsim_model, local_files_only=True)
+    model = AutoModel.from_pretrained(args.semsim_model, local_files_only=True).eval().to(device)
+    LOGGER.info("Loaded semsim DINOv3 embedder on %s", device)
+    return {"torch": torch, "cv2": cv2, "model": model, "processor": processor, "device": device}
+
+
+def semsim_shot_embeddings(records: list[dict], embedder: dict, args: argparse.Namespace):
+    """One L2-normalised embedding per shot, from adaptive frame sampling.
+
+    Unlike SCRL's fixed 3 frames, longer shots contribute more frames
+    (one per ~2 s, capped), so mid-shot scenery changes are not invisible.
+    """
+    import numpy as np
+    torch = embedder["torch"]
+    cv2 = embedder["cv2"]
+    embeddings = []
+    sampled_records = progress_or_identity(
+        records, args, total=len(records), desc="semsim embeddings", unit="shot"
+    )
+    for record in sampled_records:
+        duration = float(record["time_range_sec"][1]) - float(record["time_range_sec"][0])
+        count = int(min(args.semsim_max_frames_per_shot, max(3, round(duration / 2.0))))
+        fractions = [(index + 0.5) / count for index in range(count)]
+        frames = [cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                  for frame in iter_shot_frames(record, fractions, embedder)]
+        vectors = []
+        for start in range(0, len(frames), args.semsim_batch):
+            batch = frames[start:start + args.semsim_batch]
+            inputs = embedder["processor"](images=batch, return_tensors="pt").to(embedder["device"])
+            with torch.inference_mode():
+                output = embedder["model"](**inputs).last_hidden_state.mean(dim=1)
+            vectors.append(output.detach().cpu())
+        pooled = torch.cat(vectors, dim=0).mean(dim=0).numpy()
+        norm = float(np.linalg.norm(pooled))
+        embeddings.append(pooled / norm if norm > 0 else pooled)
+    return np.stack(embeddings, axis=0)
+
+
+def audio_energy_profile(source_path: Path, ffmpeg_bin: str):
+    """Per-100ms RMS loudness profile of a video's audio, via one ffmpeg pass.
+
+    Returns (times_sec, rms) or None when the file has no audio stream.
+    """
+    import numpy as np
+    command = [
+        ffmpeg_bin, "-hide_banner", "-loglevel", "error", "-i", str(source_path),
+        "-map", "0:a?", "-vn", "-ac", "1", "-ar", "8000", "-f", "s16le", "-",
+    ]
+    process = subprocess.Popen(command, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
+    block_samples = 800  # 100 ms at 8 kHz
+    times, values = [], []
+    index = 0
+    assert process.stdout is not None
+    try:
+        while True:
+            raw = process.stdout.read(block_samples * 2)
+            if not raw:
+                break
+            samples = np.frombuffer(raw[:len(raw) // 2 * 2], dtype=np.int16).astype(np.float32) / 32768.0
+            times.append((index + 0.5) * block_samples / 8000.0)
+            values.append(float(np.sqrt(np.mean(samples ** 2))) if samples.size else 0.0)
+            index += 1
+    finally:
+        process.stdout.close()
+        process.wait()
+    if not values:
+        return None
+    return np.asarray(times), np.asarray(values)
+
+
+def _shot_rms(records: list[dict], profile):
+    """Mean loudness per shot from the audio profile; None if no audio."""
+    if profile is None:
+        return None
+    import numpy as np
+    times, values = profile
+    result = []
+    for record in records:
+        t0, t1 = (float(v) for v in record["time_range_sec"][:2])
+        mask = (times >= t0) & (times < t1)
+        result.append(float(values[mask].mean()) if mask.any() else 0.0)
+    return np.asarray(result)
+
+
+def semsim_boundary_scores(records: list[dict], embeddings, shot_rms, args: argparse.Namespace):
+    """Scene-boundary score for each shot gap (length len(records)-1)."""
+    import numpy as np
+    count = len(records)
+    window = max(1, args.semsim_window)
+    scores = np.zeros(max(0, count - 1), dtype=np.float64)
+    if count < 2:
+        return scores
+
+    def context_mean(matrix: np.ndarray, lo: int, hi: int) -> np.ndarray:
+        return matrix[max(0, lo):max(0, hi) + 1].mean(axis=0)
+
+    for i in range(count - 1):
+        left = context_mean(embeddings, i - window + 1, i)
+        right = context_mean(embeddings, i + 1, i + window)
+        left /= max(1e-8, float(np.linalg.norm(left)))
+        right /= max(1e-8, float(np.linalg.norm(right)))
+        context_dissim = 1.0 - float(np.dot(left, right))
+        adjacent_dissim = 1.0 - float(np.dot(embeddings[i], embeddings[i + 1]))
+        visual = 0.6 * context_dissim + 0.4 * adjacent_dissim
+        audio = 0.0
+        if shot_rms is not None and args.semsim_audio_weight > 0:
+            left_r = float(shot_rms[max(0, i - window + 1):i + 1].mean())
+            right_r = float(shot_rms[i + 1:min(count, i + 1 + window)].mean())
+            spread = float(shot_rms.std()) + 1e-6
+            audio = min(3.0, abs(left_r - right_r) / spread)
+        weight = args.semsim_audio_weight if shot_rms is not None else 0.0
+        scores[i] = (1.0 - weight) * visual + weight * audio
+    return scores
+
+
+def _scene_spans(records: list[dict], boundaries: list[int]) -> list[tuple[int, int]]:
+    points = [0, *(b + 1 for b in sorted(boundaries)), len(records)]
+    return [(points[k], points[k + 1]) for k in range(len(points) - 1)]
+
+
+def semsim_scene_groups(records: list[dict], args: argparse.Namespace) -> list[list[dict]]:
+    embedder = args._semsim_embedder
+    embeddings = semsim_shot_embeddings(records, embedder, args)
+    profile = None
+    if args.semsim_audio_weight > 0:
+        source = None
+        for record in records:
+            source = _resolve_source(record, Path(record.get("source_video", ".")))
+            if source is not None:
+                break
+        if source is not None:
+            cache = getattr(args, "_semsim_audio_cache", None)
+            if cache is None:
+                cache = args._semsim_audio_cache = {}
+            if str(source) not in cache:
+                cache[str(source)] = audio_energy_profile(source, args.ffmpeg)
+            profile = cache[str(source)]
+            if profile is None:
+                LOGGER.warning("semsim: no audio stream in %s; audio cue disabled", source)
+    shot_rms = _shot_rms(records, profile)
+    scores = semsim_boundary_scores(records, embeddings, shot_rms, args)
+
+    import numpy as np
+    if args.semsim_threshold is not None:
+        threshold = float(args.semsim_threshold)
+    else:
+        threshold = float(scores.mean() + args.semsim_sigma * scores.std()) if scores.size else 1.0
+
+    def span_duration(start: int, end: int) -> float:
+        return float(records[end - 1]["time_range_sec"][1]) - float(records[start]["time_range_sec"][0])
+
+    # Duration-regularised greedy acceptance: take the strongest candidate
+    # boundaries first, but never create a scene shorter than the minimum.
+    boundaries: list[int] = []
+    candidates = [int(i) for i in np.argsort(scores)[::-1] if scores[i] > threshold]
+    for index in candidates:
+        spans = _scene_spans(records, boundaries)
+        host = next(((s, e) for s, e in spans if s <= index and index + 1 < e), None)
+        if host is None:
+            continue
+        host_start, host_end = host
+        if (span_duration(host_start, index + 1) >= args.semsim_min_scene_sec
+                and span_duration(index + 1, host_end) >= args.semsim_min_scene_sec):
+            boundaries.append(index)
+    # Enforce the maximum scene length by splitting at the strongest internal
+    # candidate (fallback: the temporal midpoint of the scene).
+    changed = True
+    while changed:
+        changed = False
+        for start, end in _scene_spans(records, boundaries):
+            if span_duration(start, end) <= args.semsim_max_scene_sec:
+                continue
+            internal = sorted(i for i in range(start, end - 1))
+            if internal:
+                best = max(internal, key=lambda i: scores[i] if i < len(scores) else -1.0)
+            else:
+                best = (start + end) // 2 - 1
+            boundaries.append(best)
+            changed = True
+            break
+    groups = [records[start:end] for start, end in _scene_spans(records, boundaries)]
+    LOGGER.info("semsim detected %d semantic scene groups (threshold=%.3f, audio=%s)",
+                len(groups), threshold, "on" if shot_rms is not None else "off")
+    return groups
+
+
 def get_scene_groups(records: list[dict], args: argparse.Namespace) -> tuple[list[list[dict]], str]:
     mode = args.scene_detector
     if mode == "none":
@@ -300,8 +589,28 @@ def get_scene_groups(records: list[dict], args: argparse.Namespace) -> tuple[lis
                 args._scrl_detector = load_scrl_detector(args)
                 return scrl_scene_groups(records, args), "scrl"
             except Exception:
-                LOGGER.warning("SCRL unavailable; using conservative metadata scene groups.", exc_info=True)
+                LOGGER.warning("SCRL unavailable; trying semsim before falling back.", exc_info=True)
+        else:
+            LOGGER.warning(
+                "SCRL weights not found (%s / %s) — auto will use semsim instead. "
+                "Set SCRL_ENCODER_PATH / SCRL_BOUNDARY_PATH to keep the SCRL behaviour.",
+                args.scrl_encoder, args.scrl_boundary)
+        if args.semsim_model.is_dir():
+            try:
+                args._semsim_embedder = load_semsim_embedder(args)
+                return semsim_scene_groups(records, args), "semsim"
+            except Exception:
+                LOGGER.warning("semsim unavailable; using metadata scene groups.", exc_info=True)
+        else:
+            LOGGER.warning(
+                "semsim DINOv3 model not found (%s) — falling back to metadata scene "
+                "groups; boundary semantics will be much weaker. Set --semsim-model "
+                "or SEMSIM_DINO_MODEL.", args.semsim_model)
         return metadata_scene_groups(records), "metadata"
+    if mode == "semsim":
+        if not hasattr(args, "_semsim_embedder"):
+            args._semsim_embedder = load_semsim_embedder(args)
+        return semsim_scene_groups(records, args), "semsim"
     if not hasattr(args, "_scrl_detector"):
         args._scrl_detector = load_scrl_detector(args)
     return scrl_scene_groups(records, args), "scrl"
@@ -474,8 +783,10 @@ def main() -> int:
     parser.add_argument("--max-sec", type=float, default=120.0)
     parser.add_argument(
         "--scene-detector",
-        choices=["auto", "scrl", "metadata", "none"],
+        choices=["auto", "scrl", "semsim", "metadata", "none"],
         default="auto",
+        help="auto: SCRL → semsim → metadata (loud warnings on each fallback); "
+             "semsim: training-free DINOv3 context self-similarity + audio contrast",
     )
     parser.add_argument("--scrl-source-dir", type=Path, default=DEFAULT_SCRL_SOURCE_DIR)
     parser.add_argument("--scrl-encoder", type=Path, default=DEFAULT_SCRL_ENCODER)
@@ -483,6 +794,20 @@ def main() -> int:
     parser.add_argument("--scrl-device", default="auto")
     parser.add_argument("--scrl-threshold", type=float, default=0.5)
     parser.add_argument("--scrl-seq-len", type=int, default=16)
+    parser.add_argument("--semsim-model", type=Path, default=DEFAULT_SEMSIM_MODEL,
+                        help="local DINOv3 directory (same format as the scene extractor)")
+    parser.add_argument("--semsim-device", default="auto")
+    parser.add_argument("--semsim-window", type=int, default=3,
+                        help="context window size (shots) on each side of a boundary")
+    parser.add_argument("--semsim-audio-weight", type=float, default=0.25,
+                        help="blend weight of the audio loudness-contrast cue (0 disables)")
+    parser.add_argument("--semsim-threshold", type=float, default=None,
+                        help="fixed boundary threshold; default adapts as mean+sigma*std")
+    parser.add_argument("--semsim-sigma", type=float, default=1.0)
+    parser.add_argument("--semsim-min-scene-sec", type=float, default=24.0)
+    parser.add_argument("--semsim-max-scene-sec", type=float, default=240.0)
+    parser.add_argument("--semsim-max-frames-per-shot", type=int, default=8)
+    parser.add_argument("--semsim-batch", type=int, default=16)
     parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--ffmpeg", default="ffmpeg")
     parser.add_argument("--crf", type=int, default=18)

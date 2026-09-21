@@ -6,6 +6,13 @@
 
 > 范围说明：切镜、global/shot/segment 三级 caption 和 ASR 属于资产链上游，本文件只说明它们与资产阶段的接口。完整 caption 链见 [`PIPELINE_README.md`](./PIPELINE_README.md) 和 [`MV_AnnotationCaption_Pipelines.md`](./MV_AnnotationCaption_Pipelines.md)。
 
+> **2026-09-21 增量**（本节为背景索引快注，权威说明见 [`docs/02`](./docs/02_全流程Pipeline说明.md) v1.4.0；均未服务器实测）：
+> 1. 主线编排新增默认首阶段 `normalize_video`（480p/15fps 统一降采样，`--no-normalize` 关闭），下游 shot/scene 输入随之改变口径；
+> 2. 全局聚合新增 `--scene-detector semsim`（免训练 DINOv3 上下文自相似 + 音频对比，BaSSL/ShotCoL/CMS 取向），`auto` 回落顺序 SCRL → semsim → metadata；SCRL/TransNetV2 权重可经 `SCRL_ENCODER_PATH`/`SCRL_BOUNDARY_PATH`/`TRANSNET_MODEL_PATH` 覆盖；
+> 3. 场景链 Stage S0 新增三个 opt-in 选项：`--shots-manifest`（采样吸附镜头边界）、`--max-scenes auto`（silhouette 定簇数）、`--anchor-selection coverage`（k-center 锚点），默认行为不变；
+> 4. 声音链 ASR 引擎 CocktailASR-1 新增多参考多说话人模式（`cocktail_asr.py --ref S1=path --ref S2=path`，目标说话人拒识多遍合并）；官方无多说话人版本，重叠语音表现待实测；
+> 5. 角色链 Stage5 替代入口（`global_align_pipeline/`）schema 已升 v2：`entity_nature`（画中人防护）、materializer `--identity-check`（人脸一致性过滤）与 `depicted_references`，详见 [`global_align_pipeline/README.md`](./global_align_pipeline/README.md)。
+
 ## 0. Pipeline 概览
 
 当前资产链不是一条完全串行的流水线，而是四条分支：

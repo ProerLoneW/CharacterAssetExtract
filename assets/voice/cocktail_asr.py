@@ -26,6 +26,14 @@ wrapper bridges the two:
   multi-speaker ASR, but a stop-gap that lets the existing pipeline keep
   using ``asr_timeline.json`` for window splitting and lexicality scoring.
 
+* **Multi-speaker transcription**
+  (``transcribe_multi_speaker(audio, references)``) approximates the
+  multi-talker mode the model does not ship with: one shared energy-gated
+  time axis, one ``transcribe_segments`` pass per reference voiceprint,
+  empty-text spans dropped (the target was absent -- CocktailASR-1's natural
+  negative-sample rejection), and cross-speaker duplicates collapsed by
+  time overlap plus a text-prefix match.
+
 The confidence score is approximated: CocktailASR-1 has no per-segment logprob,
 so we report ``1.0`` when the output is non-empty and ``0.0`` when the model
 rejected the reference (negative-sample empty string).  This is enough for the
@@ -125,6 +133,89 @@ def pick_auto_reference(audio: np.ndarray,
     start_frame = int(np.argmax(smoothed))
     start_sample = start_frame * window
     return audio[start_sample: start_sample + target_len].astype(np.float32, copy=False)
+
+
+def energy_segments(audio: np.ndarray,
+                    min_sec: float = 0.5,
+                    max_sec: float = 30.0,
+                    gap_merge: float = 0.3,
+                    sample_rate: int = SAMPLE_RATE) -> list[list[float]]:
+    """Split ``audio`` into ``[start, end]`` speech candidates on frame energy.
+
+    Same 50 ms-window RMS measurement as :func:`pick_auto_reference`, but
+    instead of returning the single loudest run it returns *every* run whose
+    frames stay above an energy threshold.  The threshold sits 10 % of the
+    way from the noise floor (20th-percentile frame RMS) to the speech peak
+    (95th percentile), which keeps the gate tolerant of recording levels
+    while still rejecting background hiss.  Runs separated by less than
+    ``gap_merge`` seconds are bridged so a breath does not split a turn,
+    runs shorter than ``min_sec`` are dropped as clicks, and runs longer
+    than ``max_sec`` are split into even chunks so a single decode never
+    exceeds a comfortable span.
+
+    The result is speaker-agnostic: every reference voiceprint scored in
+    ``transcribe_multi_speaker`` is decoded against these same windows,
+    which is what makes the later IoU-based cross-speaker dedup meaningful.
+    """
+    if len(audio) == 0:
+        return []
+    window = int(0.05 * sample_rate)
+    if window <= 0 or len(audio) < window:
+        return [[0.0, round(len(audio) / sample_rate, 3)]]
+    n_frames = len(audio) // window
+    frames = audio[: n_frames * window].reshape(n_frames, window)
+    rms = np.sqrt(np.mean(frames.astype(np.float64) ** 2, axis=1) + 1e-12)
+    noise_floor = float(np.percentile(rms, 20))
+    speech_peak = float(np.percentile(rms, 95))
+    if speech_peak <= 1e-4:
+        # Digital silence (or a numerically flat waveform): nothing to gate.
+        return []
+    runs: list[list[float]]
+    if speech_peak - noise_floor <= 1e-6:
+        # Flat but non-silent energy: treat the whole clip as one candidate.
+        runs = [[0.0, n_frames * window / sample_rate]]
+    else:
+        threshold = noise_floor + 0.1 * (speech_peak - noise_floor)
+        active = rms > threshold
+        runs = []
+        start_frame: Optional[int] = None
+        for i, is_active in enumerate(active):
+            if is_active and start_frame is None:
+                start_frame = i
+            elif not is_active and start_frame is not None:
+                runs.append([start_frame * window / sample_rate,
+                             i * window / sample_rate])
+                start_frame = None
+        if start_frame is not None:
+            runs.append([start_frame * window / sample_rate,
+                         n_frames * window / sample_rate])
+    # Bridge short pauses so one breath does not split a turn.
+    merged: list[list[float]] = []
+    for seg in runs:
+        if merged and seg[0] - merged[-1][1] <= gap_merge:
+            merged[-1][1] = seg[1]
+        else:
+            merged.append([seg[0], seg[1]])
+    # Drop clicks and cap the per-decode span.
+    result: list[list[float]] = []
+    for start, end in merged:
+        if end - start < min_sec:
+            continue
+        n_chunks = max(1, int(math.ceil((end - start) / max_sec)))
+        chunk_len = (end - start) / n_chunks
+        for k in range(n_chunks):
+            result.append([round(start + k * chunk_len, 3),
+                           round(start + (k + 1) * chunk_len, 3)])
+    return result
+
+
+def _segment_iou(a: Sequence[float], b: Sequence[float]) -> float:
+    """Intersection-over-union of two ``[start, end]`` spans in seconds."""
+    inter = min(a[1], b[1]) - max(a[0], b[0])
+    if inter <= 0:
+        return 0.0
+    union = max(a[1], b[1]) - min(a[0], b[0])
+    return inter / union if union > 0 else 0.0
 
 
 def _prepare_waveform(target: np.ndarray, ref: np.ndarray,
@@ -315,6 +406,107 @@ class CocktailASRTranscriber:
             i = j
         return rows
 
+    def transcribe_multi_speaker(self,
+                                 audio: Union[str, Path, np.ndarray],
+                                 references: Sequence[dict[str, Any]],
+                                 min_sec: float = 0.5,
+                                 max_sec: float = 30.0,
+                                 gap_merge: float = 0.3,
+                                 dedup_iou: float = 0.7,
+                                 dedup_prefix_chars: int = 20
+                                 ) -> dict[str, Any]:
+        """Transcribe several target speakers with one model pass per reference.
+
+        CocktailASR-1 has no native multi-speaker mode: one reference
+        voiceprint buys one target speaker, and an absent target yields an
+        empty string (a natural negative sample).  The multi-speaker
+        timeline is therefore assembled in three steps:
+
+        1. One shared, speaker-agnostic time axis is cut once with
+           :func:`energy_segments` (the 50 ms frame-RMS gate behind
+           ``pick_auto_reference``) and reused for every reference, so rows
+           from different speakers land on comparable spans.
+        2. ``transcribe_segments`` runs once per ``references`` entry over
+           that axis.  Empty-text rows are dropped -- they mean the target
+           was not speaking in that span -- and surviving rows are tagged
+           with ``speaker_id`` and ``matched_ref``.
+        3. Rows are sorted by start, renumbered ``ASR#####`` across all
+           speakers, and cross-speaker duplicates (IoU over the time span
+           greater than ``dedup_iou`` *and* identical first
+           ``dedup_prefix_chars`` characters of text) are collapsed to the
+           row with the longer text, the loser recorded in
+           ``dropped_duplicates``.
+
+        ``references`` is a list of ``{"speaker_id": "S1", "ref_audio":
+        "path.wav"}`` dicts.  Returns ``{"segments": rows,
+        "references_used": [...], "dropped_duplicates": [...],
+        "per_reference_segment_count": {...}}``; the per-reference counts
+        are taken *before* dedup, i.e. how many spans each voiceprint
+        claimed.
+        """
+        if not references:
+            raise ValueError("references must contain at least one entry")
+        waveform = _load_audio(audio)
+        segments = energy_segments(waveform, min_sec=min_sec, max_sec=max_sec,
+                                   gap_merge=gap_merge)
+        references_used: list[dict[str, Any]] = []
+        per_reference_segment_count: dict[str, int] = {}
+        candidates: list[dict[str, Any]] = []
+        for i, entry in enumerate(references):
+            ref_audio = entry.get("ref_audio")
+            if ref_audio is None:
+                raise ValueError(f"reference entry {i} is missing 'ref_audio'")
+            speaker_id = str(entry.get("speaker_id") or f"SPK{i + 1:02d}")
+            matched_ref = str(ref_audio) if isinstance(ref_audio, (str, Path)) \
+                else f"<ref[{i}]>"
+            rows = self.transcribe_segments(waveform, segments,
+                                            ref_audio=ref_audio)
+            kept_rows = [row for row in rows if row["text"]]
+            for row in kept_rows:
+                row["speaker_id"] = speaker_id
+                row["matched_ref"] = matched_ref
+            candidates.extend(kept_rows)
+            references_used.append({"speaker_id": speaker_id,
+                                    "ref_audio": matched_ref})
+            per_reference_segment_count[speaker_id] = (
+                per_reference_segment_count.get(speaker_id, 0) + len(kept_rows))
+        candidates.sort(key=lambda row: (row["start"], row["speaker_id"]))
+        kept: list[dict[str, Any]] = []
+        dropped_duplicates: list[dict[str, Any]] = []
+        for row in candidates:
+            winner = None
+            for other in kept:
+                if other["speaker_id"] == row["speaker_id"]:
+                    continue
+                if _segment_iou((other["start"], other["end"]),
+                                (row["start"], row["end"])) <= dedup_iou:
+                    continue
+                if (other["text"][:dedup_prefix_chars]
+                        != row["text"][:dedup_prefix_chars]):
+                    continue
+                winner = other
+                break
+            if winner is None:
+                kept.append(row)
+            elif len(row["text"]) > len(winner["text"]):
+                # The newcomer has the longer text: evict the incumbent.
+                kept.remove(winner)
+                dropped_duplicates.append(
+                    {**winner, "superseded_by": row["speaker_id"]})
+                kept.append(row)
+            else:
+                dropped_duplicates.append(
+                    {**row, "superseded_by": winner["speaker_id"]})
+        kept.sort(key=lambda row: row["start"])
+        for i, row in enumerate(kept):
+            row["asr_id"] = f"ASR{i + 1:05d}"
+        return {
+            "segments": kept,
+            "references_used": references_used,
+            "dropped_duplicates": dropped_duplicates,
+            "per_reference_segment_count": per_reference_segment_count,
+        }
+
 
 def _strip_cot_wrappers(text: str) -> str:
     """CocktailASR-1's CoT mode wraps the answer in <think>...</think><answer>...</answer>."""
@@ -337,9 +529,18 @@ def _parse_args() -> "argparse.Namespace":
     )
     p.add_argument("--audio", required=True,
                    help="Path to a wav/flac/mp3 file (auto-resampled to 16 kHz mono).")
-    p.add_argument("--ref",
-                   help="Optional reference voiceprint wav.  When omitted, the loudest "
-                        "1-4 s clip in --audio is used as the reference.")
+    p.add_argument("--ref", action="append", metavar="REF",
+                   help="Reference voiceprint wav.  A plain path keeps the legacy "
+                        "single-reference mode (one whole-audio decode against that "
+                        "voiceprint); the SPEAKER_ID=path.wav form, repeatable, adds "
+                        "one multi-speaker reference per flag instead.  When omitted "
+                        "entirely, the loudest 1-4 s clip in --audio is used as the "
+                        "reference.")
+    p.add_argument("--ref-list", metavar="JSON",
+                   help="Path to a JSON array of {\"speaker_id\", \"ref_audio\"} rows; "
+                        "switches to multi-speaker mode and is merged with any "
+                        "--ref SPEAKER_ID=path.wav entries.  Use this when a path "
+                        "itself contains '='.")
     p.add_argument("--model-dir", default=DEFAULT_MODEL_DIR)
     p.add_argument("--device", default="cuda", choices=["cuda", "cpu"])
     p.add_argument("--dtype", default="bfloat16", choices=["bfloat16", "float16", "float32"])
@@ -351,13 +552,83 @@ def _parse_args() -> "argparse.Namespace":
     return p.parse_args()
 
 
+def _collect_references(args: "argparse.Namespace"
+                        ) -> tuple[Optional[str], Optional[list[dict[str, Any]]]]:
+    """Split ``--ref`` / ``--ref-list`` into the legacy and multi-speaker modes.
+
+    Returns ``(single_ref, multi_refs)`` where exactly one element is set.
+    ``single_ref`` is the pre-multi-speaker CLI contract (one plain ``--ref
+    path.wav``, no ``--ref-list``) so ``main`` keeps its old behavior; a
+    ``SPEAKER_ID=path.wav`` entry or a ``--ref-list`` file (or several plain
+    ``--ref`` paths) switch to ``multi_refs`` instead, with any plain paths
+    folded in under auto-assigned ``SPK##`` ids.
+    """
+    plain: list[str] = []
+    entries: list[dict[str, Any]] = []
+    for raw in args.ref or []:
+        if "=" not in raw:
+            plain.append(raw)
+            continue
+        speaker_id, _, path = raw.partition("=")
+        speaker_id, path = speaker_id.strip(), path.strip()
+        if not speaker_id or not path:
+            raise SystemExit(f"--ref expects SPEAKER_ID=path.wav, got: {raw}")
+        entries.append({"speaker_id": speaker_id, "ref_audio": path})
+    if args.ref_list is not None:
+        import json
+        payload = json.loads(Path(args.ref_list).read_text(encoding="utf-8"))
+        if not isinstance(payload, list):
+            raise SystemExit(f"--ref-list expects a JSON array: {args.ref_list}")
+        for i, item in enumerate(payload):
+            if not isinstance(item, dict) or not item.get("ref_audio"):
+                raise SystemExit(f"--ref-list entry {i} needs a 'ref_audio' field: "
+                                 f"{item!r}")
+            speaker_id = str(item.get("speaker_id") or f"SPK{i + 1:02d}")
+            entries.append({"speaker_id": speaker_id,
+                            "ref_audio": str(item["ref_audio"])})
+    if not entries and len(plain) <= 1:
+        return (plain[0] if plain else None), None
+    # Multi-speaker run: fold plain legacy paths in with auto speaker ids.
+    used = {entry["speaker_id"] for entry in entries}
+    n = 1
+    for path in plain:
+        while f"SPK{n:02d}" in used:
+            n += 1
+        sid = f"SPK{n:02d}"
+        used.add(sid)
+        entries.append({"speaker_id": sid, "ref_audio": path})
+    return None, entries
+
+
+def _run_multi_speaker(transcriber: CocktailASRTranscriber,
+                       args: "argparse.Namespace",
+                       references: list[dict[str, Any]]) -> int:
+    """CLI front-end for ``transcribe_multi_speaker`` (one pass per reference)."""
+    import json
+    payload = transcriber.transcribe_multi_speaker(args.audio, references)
+    if args.output:
+        Path(args.output).write_text(json.dumps(payload, ensure_ascii=False, indent=2))
+    for ref in payload["references_used"]:
+        count = payload["per_reference_segment_count"].get(ref["speaker_id"], 0)
+        print(f"[ref] {ref['speaker_id']}: {ref['ref_audio']} -> {count} segment(s)")
+    print(f"[dedup] dropped {len(payload['dropped_duplicates'])} "
+          f"cross-speaker duplicate(s)")
+    for row in payload["segments"]:
+        print(f"[{row['start']:.2f}s - {row['end']:.2f}s] {row['speaker_id']}: "
+              f"{row['text']}")
+    return 0
+
+
 def main() -> int:
     args = _parse_args()
     transcriber = CocktailASRTranscriber(
         model_dir=args.model_dir, device=args.device, dtype=args.dtype, cot=args.cot)
-    if args.ref is not None:
+    single_ref, multi_refs = _collect_references(args)
+    if multi_refs is not None:
+        return _run_multi_speaker(transcriber, args, multi_refs)
+    if single_ref is not None:
         result = transcriber.transcribe_segments(
-            args.audio, [(0.0, float("inf"))], ref_audio=args.ref)
+            args.audio, [(0.0, float("inf"))], ref_audio=single_ref)
     else:
         result = transcriber.transcribe(args.audio)
     if args.output:

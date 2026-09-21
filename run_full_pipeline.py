@@ -4,12 +4,14 @@
 
 给一个输入目录(或显式视频列表)+ 每个视频的 ASR 文件,按主线顺序产出全部产物:
 
-    切镜 → 全局聚合 → 全局描述(说话归属) → 镜头描述 → 固定段规划
+    统一降采样(480p/15fps,--no-normalize 关闭) → 切镜 → 全局聚合 → 全局描述(说话归属)
+    → 镜头描述 → 固定段规划
     → 片段描述 → 片段视频 → 人物轨迹 → 轨迹全局归属 → 角色声音候选 → 角色素材物化
     → 关键物体候选 → 物体定位分割 → 物体参考集 → 场景参考图
 
 对应模块与入口(均为各阶段最新版):
 
+    normalize_video   preprocessing/normalize_video.py                (统一降采样,默认 480p/15fps)
     shot_split        shot_splitter.py                              (--flat)
     global_group      global_clip_aggregator.py                     (--flat)
     global_describe   mimo_global_captioner_speaker_v2.py           (含 ASR 说话归属)
@@ -96,10 +98,21 @@ def _py(script: Path) -> str:
 
 def _stages(ns: argparse.Namespace) -> list[Stage]:
     """ns 提供 concurrency/retries/timeout 等编排级参数。ctx 见 VideoJob。"""
-    return [
+    # 统一降采样开启时,直接读视频的阶段(切镜/场景选帧)消费 normalized.mp4;
+    # --no-normalize 时回落为原始视频,下游布局不变。
+    base_video = lambda c: str(c.ws / "normalized" / "normalized.mp4") if (not ns.no_normalize) else str(c.video)
+    normalize_stage = Stage("normalize_video", "统一降采样", "normalize",
+                            lambda c: [sys.executable, _py(HERE / "preprocessing" / "normalize_video.py"),
+                                       "--input", str(c.video),
+                                       "--output", str(c.ws / "normalized" / "normalized.mp4"),
+                                       "--height", str(ns.norm_height), "--fps", str(ns.norm_fps)]
+                                      + ([] if ns.force else ["--skip-existing"]),
+                            lambda c: c.ws / "normalized" / "normalized.mp4",
+                            lambda c: [c.video])
+    stages: list[Stage] = [
         Stage("split_shots", "切镜", "shot_split",
               lambda c: [sys.executable, _py(HERE / "shot_splitter.py"),
-                         "--input", str(c.video), "--output-dir", str(c.ws / "shots"),
+                         "--input", base_video(c), "--output-dir", str(c.ws / "shots"),
                          "--detector", ns.detector, "--flat"],
               lambda c: c.ws / "shots" / "shots.jsonl",
               lambda c: [c.video]),
@@ -214,11 +227,13 @@ def _stages(ns: argparse.Namespace) -> list[Stage]:
                          c.ws / "key_object" / "grounding_queue.jsonl"]),
         Stage("scene_select", "场景参考图", "scene_select",
               lambda c: [sys.executable, _py(HERE / "assets" / "scene" / "important_scene_frame_extractor.py"),
-                         str(c.video),
+                         base_video(c),
                          "--output-dir", str(c.ws / "scene"), "--overwrite"],
-              lambda c: c.ws / "scene" / c.video.stem / "scene_index.json",
+              lambda c: c.ws / "scene" / Path(base_video(c)).stem / "scene_index.json",
               lambda c: [c.video]),
     ]
+    # 不开 --no-normalize 时,统一降采样是第一阶段
+    return stages if ns.no_normalize else [normalize_stage] + stages
 
 
 # ---------------------------------------------------------------------------
@@ -497,6 +512,12 @@ def parse_args() -> argparse.Namespace:
     out.add_argument("--dry-run", action="store_true", help="只打印计划,不执行")
     out.add_argument("--list-stages", action="store_true", help="列出阶段后退出")
     out.add_argument("--ignore-preflight", action="store_true", help="预检仅警告不拦截")
+
+    pre = p.add_argument_group("视频预处理(统一降采样)")
+    pre.add_argument("--no-normalize", action="store_true",
+                     help="跳过 normalize_video 阶段,切镜/场景选帧直接消费原始视频")
+    pre.add_argument("--norm-height", type=int, default=480, help="统一降采样目标高度")
+    pre.add_argument("--norm-fps", type=float, default=15, help="统一降采样目标帧率")
 
     cap = p.add_argument_group("模型与阶段参数(透传)")
     cap.add_argument("--detector", default="auto", help="切镜检测器")

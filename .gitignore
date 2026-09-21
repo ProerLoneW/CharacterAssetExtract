@@ -4,6 +4,8 @@
 local_models/
 _backup*
 !docs/*
+!prompts/
+!prompts/**
 !*README.md
 
 

@@ -12,12 +12,21 @@ import json
 import math
 import re
 import subprocess
+import sys
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 import numpy as np
 import soundfile as sf
+
+# ``cocktail_asr`` and ``audio_foreground_separator`` are sibling modules imported
+# by bare name; that only resolves when this directory is on sys.path (true when
+# the script is run directly from assets/voice/, false under ``python -m``). Add
+# it once here so both lazy imports work in either launch mode.
+_EFP_ROOT = Path(__file__).resolve().parent
+if str(_EFP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_EFP_ROOT))
 
 SCHEMA_VERSION = "speaker-registry-v2"
 SAMPLE_RATE = 16000
