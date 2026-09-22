@@ -398,6 +398,11 @@ async def annotate_manifest(manifest: Path, args: argparse.Namespace, client, gl
         )
         if not pending or total_failed == 0:
             break
+        # Do not sleep after the final configured round.  The previous logic
+        # logged a phantom "next round" and waited even though the loop could
+        # not issue another request, needlessly delaying the pipeline.
+        if round_no >= rounds:
+            break
         LOGGER.warning("%s: round %d left %d failures, running next round", manifest.parent.name, round_no, total_failed)
         backoff = min(300.0, 60.0 * (2 ** (round_no - 1)))
         LOGGER.info("%s: sleeping %.0fs before retry round %d", manifest.parent.name, backoff, round_no + 1)

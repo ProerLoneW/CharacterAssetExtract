@@ -85,10 +85,36 @@ export function useSpecStreaming(onSpecChange?: (spec: Spec) => void) {
 export function useRuns() {
   const [runs, setRuns] = useState<RunSummary[] | null>(null)
   useEffect(() => {
-    api
-      .runs()
-      .then((r) => setRuns(r.runs))
-      .catch(() => setRuns([]))
+    let stopped = false
+    let timer: number | undefined
+    let loadedOnce = false
+    const tick = async () => {
+      if (stopped) return
+      try {
+        const response = await api.runs()
+        if (!stopped) {
+          loadedOnce = true
+          setRuns(response.runs)
+        }
+      } catch {
+        // supervisor 重启后端的短暂窗口内保留旧列表,避免下拉框闪空。
+        if (!stopped && !loadedOnce) setRuns([])
+      }
+      if (!stopped) timer = window.setTimeout(tick, document.hidden ? 8000 : 3000)
+    }
+    void tick()
+    const onVisibility = () => {
+      if (!document.hidden && timer) {
+        window.clearTimeout(timer)
+        timer = window.setTimeout(tick, 0)
+      }
+    }
+    document.addEventListener('visibilitychange', onVisibility)
+    return () => {
+      stopped = true
+      if (timer) window.clearTimeout(timer)
+      document.removeEventListener('visibilitychange', onVisibility)
+    }
   }, [])
   return runs
 }

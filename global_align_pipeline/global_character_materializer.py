@@ -35,8 +35,8 @@ from typing import Any, Dict, List, Optional
 _EFP_ROOT = Path(__file__).resolve().parents[1]
 _VP_DIR = _EFP_ROOT / "assets" / "visual_person"
 for _path in (_EFP_ROOT, _VP_DIR):
-    if str(_path) not in _sys.path:
-        _sys.path.insert(0, str(_path))
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 LOGGER = logging.getLogger("global_character_materializer")
 SCHEMA_VERSION = "global-character-materialization-v2"

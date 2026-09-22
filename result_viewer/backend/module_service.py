@@ -8,6 +8,8 @@
 
 from __future__ import annotations
 
+import json
+
 from .adapters import get_adapter
 from .adapters.base import RunContext
 from .config import RuntimeConfig
@@ -23,6 +25,23 @@ from .envelope import (
 )
 from .media_service import MediaService
 from .run_registry import RunDescriptor, RunRegistry
+
+
+def pipeline_status(run, module_id, fallback):
+    """An in-progress output file does not mean its producing stage finished."""
+    path = run.resolve_binding_path('pipeline_state')
+    if path is None:
+        return fallback
+    try:
+        stages = json.loads(path.read_text(encoding='utf-8')).get('stages', {})
+    except (OSError, ValueError):
+        return fallback
+    entries = [entry for entry in stages.values() if entry.get('module_id') == module_id]
+    for status in ('running', 'failed'):
+        if any(entry.get('status') == status for entry in entries):
+            return {**fallback, 'execution': status,
+                    'reason': '流水线正在处理，已有产物可预览' if status == 'running' else '该阶段执行失败，请查看实验日志'}
+    return fallback
 
 _RUN_CONTEXTS: dict[str, RunContext] = {}
 
@@ -170,6 +189,7 @@ class ModuleService:
                 entry["filters_available"] = {k: [] for k in meta["view"]["filters"]}
                 entry["scopes"] = ctx.scopes()
                 entry["warnings"] = []
+            entry['status'] = pipeline_status(run, meta['id'], entry['status'])
             modules.append(entry)
         return {
             "api_version": "1.0",
@@ -216,7 +236,8 @@ class ModuleService:
             adapter_version=f"{adapter.adapter_id}/{adapter.adapter_version}",
             run_id=run_id,
             module_id=module_id,
-            status=(summary.status if summary else {"execution": probe.execution, "quality": probe.quality, "reason": probe.reason}),
+            status=pipeline_status(run, module_id, summary.status if summary else
+                                   {"execution": probe.execution, "quality": probe.quality, "reason": probe.reason}),
             metrics=(summary.metrics if summary else []),
             items=items,
             page=page,

@@ -1,41 +1,785 @@
 {
-  "listen_host": "127.0.0.1",
-  "service_port": 8930,
+  "listen_host": "0.0.0.0",
+  "service_port": 80,
   "base_path": "",
   "doc_path": "../docs/02_全流程Pipeline说明.md",
   "frontend_dist": "./frontend_dist",
-  "allowed_runs": ["movie_full_pipeline_20260912_v4"],
+  "allowed_runs": [
+    "movie_full_pipeline_20260912_v4",
+    "video1",
+    "video2",
+    "video3",
+    "full_pipeline_0920_20260921_092547_i2i_tts_video1",
+    "full_pipeline_0920_20260921_092547_i2i_tts_video2",
+    "full_pipeline_0920_20260921_092547_i2i_tts_video3"
+  ],
   "runs": {
     "movie_full_pipeline_20260912_v4": {
       "video_id": "1080P",
-      "title": "0912_v4 旧链整合运行(本仓库内样本)",
+      "title": "0912_v4 旧链整合运行",
       "layout_profile": "custom",
       "route_id": "legacy-chr",
       "produced_code_revision": null,
       "created_at": "2026-09-12",
-      "workspace_root": "../movie_full_pipeline_20260912_v4",
+      "workspace_root": "../../workspace/movie_full_pipeline_20260912_v4",
       "source_roots": [
-        { "root_id": "run_root", "path": "../movie_full_pipeline_20260912_v4" }
+        {
+          "root_id": "run_root",
+          "path": "../../workspace/movie_full_pipeline_20260912_v4"
+        },
+        {
+          "root_id": "middle",
+          "path": "/gemini/platform/public/aigc/lss/Interns/wyn/general_video_annotation_level3_v2/workspace/movie_full_pipeline_20260912/middle"
+        },
+        {
+          "root_id": "segments",
+          "path": "/gemini/platform/public/aigc/lss/Interns/wyn/general_video_annotation_level3_v2/workspace/movie_full_pipeline_20260912/segments"
+        },
+        {
+          "root_id": "voice_by_role_src",
+          "path": "/gemini/platform/public/aigc/lss/Interns/wyn/general_video_annotation_level3_v2/workspace/movie_full_pipeline_20260912/assets/voice_by_role"
+        },
+        {
+          "root_id": "assets_visual_person_v2_tracklets",
+          "path": "/gemini/platform/public/aigc/lss/Interns/wyn/general_video_annotation_level3_v2/workspace/movie_full_pipeline_20260912_v4/assets/visual_person_v2/tracklets"
+        },
+        {
+          "root_id": "shot_clips",
+          "path": "/gemini/platform/public/aigc/lss/Interns/wyn/general_video_annotation_level3_v2/workspace/movie_full_pipeline_20260912/shots/clips"
+        }
       ],
       "path_rewrites": [
-        { "pattern": "^.*/movie_full_pipeline_20260912_v4/", "replacement": "{run_root}/" },
-        { "pattern": "^.*/movie_full_pipeline_20260912/segments/(.*)$", "replacement": "{run_root}/segments/$1" },
-        { "pattern": "^.*/movie_full_pipeline_20260912/shots/clips/[^/]*_shot_(\\d+)\\.mp4$", "replacement": "{run_root}/middle/shot_clips/SHOT_$1.mp4" },
-        { "pattern": "^.*/voice_by_role_src/(.*)$", "replacement": "{run_root}/voice_by_role_src/$1" }
+        {
+          "pattern": "^.*/movie_full_pipeline_20260912_v4/",
+          "replacement": "{run_root}/"
+        },
+        {
+          "pattern": "^.*/movie_full_pipeline_20260912/segments/(.*)$",
+          "replacement": "{run_root}/segments/$1"
+        },
+        {
+          "pattern": "^.*/movie_full_pipeline_20260912/shots/clips/[^/]*_shot_(\\d+)\\.mp4$",
+          "replacement": "{run_root}/middle/shot_clips/SHOT_$1.mp4"
+        },
+        {
+          "pattern": "^.*/voice_by_role_src/(.*)$",
+          "replacement": "{run_root}/voice_by_role_src/$1"
+        }
       ],
       "artifact_bindings": {
-        "shots": { "relative_path": "middle/shots.jsonl", "producer_module_id": "shot_split" },
-        "globals": { "relative_path": "middle/global_clips.jsonl", "producer_module_id": "global_group" },
-        "global_captions": { "relative_path": "captions_speaker/global/global_captions.jsonl", "producer_module_id": "global_describe" },
-        "attributed_asr": { "relative_path": "captions_speaker/global/speaker_attributed_asr.jsonl", "producer_module_id": "global_describe" },
-        "shot_captions": { "relative_path": "captions_speaker/shot/shot_captions.jsonl", "producer_module_id": "shot_describe" },
-        "segment_captions": { "relative_path": "captions_speaker/segment/segment_captions.jsonl", "producer_module_id": "segment_describe" },
-        "segment_media": { "relative_path": "segments/segments.jsonl", "producer_module_id": "segment_export", "source_run_id": "movie_full_pipeline_20260912" },
-        "voice_previews": { "relative_path": "voice_by_role_src/all_asr_manifest.jsonl", "producer_module_id": "voice_preview" },
-        "tracklets": { "relative_path": "assets/visual_person_v2/tracklets", "producer_module_id": "person_tracks" },
-        "role_binding": { "relative_path": "characters/role_alignment.json", "producer_module_id": "legacy_bind" },
-        "legacy_characters": { "relative_path": "characters/characters", "producer_module_id": "legacy_bind" }
+        "shots": {
+          "relative_path": "middle/shots.jsonl",
+          "producer_module_id": "shot_split"
+        },
+        "globals": {
+          "relative_path": "middle/global_clips.jsonl",
+          "producer_module_id": "global_group"
+        },
+        "global_captions": {
+          "relative_path": "captions_speaker/global/global_captions.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "attributed_asr": {
+          "relative_path": "captions_speaker/global/speaker_attributed_asr.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "shot_captions": {
+          "relative_path": "captions_speaker/shot/shot_captions.jsonl",
+          "producer_module_id": "shot_describe"
+        },
+        "segment_captions": {
+          "relative_path": "captions_speaker/segment/segment_captions.jsonl",
+          "producer_module_id": "segment_describe"
+        },
+        "segment_media": {
+          "relative_path": "segments/segments.jsonl",
+          "producer_module_id": "segment_export",
+          "source_run_id": "movie_full_pipeline_20260912"
+        },
+        "voice_previews": {
+          "relative_path": "voice_by_role_src/all_asr_manifest.jsonl",
+          "producer_module_id": "voice_preview"
+        },
+        "tracklets": {
+          "relative_path": "assets/visual_person_v2/tracklets",
+          "producer_module_id": "person_tracks"
+        },
+        "role_binding": {
+          "relative_path": "characters/role_alignment.json",
+          "producer_module_id": "legacy_bind"
+        },
+        "legacy_characters": {
+          "relative_path": "characters/characters",
+          "producer_module_id": "legacy_bind"
+        }
+      }
+    },
+    "video1": {
+      "video_id": "video1",
+      "title": "video1 全流程主线运行(video1)",
+      "layout_profile": "custom",
+      "route_id": "fixed-global-align",
+      "produced_code_revision": null,
+      "created_at": "2026-09-21",
+      "workspace_root": "../../workspace/full_pipeline_0920_20260921_113727/video1",
+      "source_roots": [
+        {
+          "root_id": "run_root",
+          "path": "../../workspace/full_pipeline_0920_20260921_113727/video1"
+        },
+        {
+          "root_id": "asr_root",
+          "path": "/gemini/platform/public/aigc/lss/Interns/wyn/general_video_annotation_level3_v2/workspace/full_pipeline_0920_20260921_113727/asr"
+        }
+      ],
+      "path_rewrites": [
+        {
+          "pattern": "^.*/video1/",
+          "replacement": "{run_root}/"
+        }
+      ],
+      "artifact_bindings": {
+        "pipeline_state": {
+          "relative_path": "pipeline_state.json"
+        },
+        "authoritative_asr": {
+          "relative_path": "video1.asr.jsonl",
+          "root_id": "asr_root",
+          "producer_module_id": "asr_timeline"
+        },
+        "segment_plan": {
+          "relative_path": "segment_plan/segments_window/segments.jsonl",
+          "producer_module_id": "segment_plan"
+        },
+        "shots": {
+          "relative_path": "shots/shots.jsonl",
+          "producer_module_id": "shot_split"
+        },
+        "globals": {
+          "relative_path": "global/global_clips.jsonl",
+          "producer_module_id": "global_group"
+        },
+        "global_captions": {
+          "relative_path": "captions/global/global_captions.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "attributed_asr": {
+          "relative_path": "captions/global/speaker_attributed_asr.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "shot_captions": {
+          "relative_path": "captions/shot/shot_captions.jsonl",
+          "producer_module_id": "shot_describe"
+        },
+        "segment_captions": {
+          "relative_path": "captions/segment/segment_captions.jsonl",
+          "producer_module_id": "segment_describe"
+        },
+        "segment_media": {
+          "relative_path": "segments/segments.jsonl",
+          "producer_module_id": "segment_export"
+        },
+        "tracklets": {
+          "relative_path": "tracklets",
+          "producer_module_id": "person_tracks"
+        },
+        "direct_alignment": {
+          "relative_path": "global_alignment/global_tracklet_alignment.jsonl",
+          "producer_module_id": "person_align"
+        },
+        "voice_previews": {
+          "relative_path": "voice_by_role_src/all_asr_manifest.jsonl",
+          "producer_module_id": "voice_preview"
+        },
+        "characters": {
+          "relative_path": "characters",
+          "producer_module_id": "character_pack"
+        },
+        "character_summary": {
+          "relative_path": "materialization_summary.json",
+          "producer_module_id": "character_pack"
+        },
+        "object_candidates": {
+          "relative_path": "key_object/grounding_queue.jsonl",
+          "producer_module_id": "object_queue"
+        },
+        "object_observations": {
+          "relative_path": "key_object/grounding/object_observations.jsonl",
+          "producer_module_id": "object_ground"
+        },
+        "object_references": {
+          "relative_path": "key_object/grounding/reference_sets.json",
+          "producer_module_id": "object_ground"
+        },
+        "scene_assets": {
+          "relative_path": "scene",
+          "producer_module_id": "scene_select"
+        }
+      }
+    },
+    "video2": {
+      "video_id": "video2",
+      "title": "video2 全流程主线运行(video2)",
+      "layout_profile": "custom",
+      "route_id": "fixed-global-align",
+      "produced_code_revision": null,
+      "created_at": "2026-09-21",
+      "workspace_root": "../../workspace/full_pipeline_0920_20260921_113727/video2",
+      "source_roots": [
+        {
+          "root_id": "run_root",
+          "path": "../../workspace/full_pipeline_0920_20260921_113727/video2"
+        },
+        {
+          "root_id": "asr_root",
+          "path": "/gemini/platform/public/aigc/lss/Interns/wyn/general_video_annotation_level3_v2/workspace/full_pipeline_0920_20260921_113727/asr"
+        }
+      ],
+      "path_rewrites": [
+        {
+          "pattern": "^.*/video2/",
+          "replacement": "{run_root}/"
+        }
+      ],
+      "artifact_bindings": {
+        "pipeline_state": {
+          "relative_path": "pipeline_state.json"
+        },
+        "authoritative_asr": {
+          "relative_path": "video2.asr.jsonl",
+          "root_id": "asr_root",
+          "producer_module_id": "asr_timeline"
+        },
+        "segment_plan": {
+          "relative_path": "segment_plan/segments_window/segments.jsonl",
+          "producer_module_id": "segment_plan"
+        },
+        "shots": {
+          "relative_path": "shots/shots.jsonl",
+          "producer_module_id": "shot_split"
+        },
+        "globals": {
+          "relative_path": "global/global_clips.jsonl",
+          "producer_module_id": "global_group"
+        },
+        "global_captions": {
+          "relative_path": "captions/global/global_captions.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "attributed_asr": {
+          "relative_path": "captions/global/speaker_attributed_asr.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "shot_captions": {
+          "relative_path": "captions/shot/shot_captions.jsonl",
+          "producer_module_id": "shot_describe"
+        },
+        "segment_captions": {
+          "relative_path": "captions/segment/segment_captions.jsonl",
+          "producer_module_id": "segment_describe"
+        },
+        "segment_media": {
+          "relative_path": "segments/segments.jsonl",
+          "producer_module_id": "segment_export"
+        },
+        "tracklets": {
+          "relative_path": "tracklets",
+          "producer_module_id": "person_tracks"
+        },
+        "direct_alignment": {
+          "relative_path": "global_alignment/global_tracklet_alignment.jsonl",
+          "producer_module_id": "person_align"
+        },
+        "voice_previews": {
+          "relative_path": "voice_by_role_src/all_asr_manifest.jsonl",
+          "producer_module_id": "voice_preview"
+        },
+        "characters": {
+          "relative_path": "characters",
+          "producer_module_id": "character_pack"
+        },
+        "character_summary": {
+          "relative_path": "materialization_summary.json",
+          "producer_module_id": "character_pack"
+        },
+        "object_candidates": {
+          "relative_path": "key_object/grounding_queue.jsonl",
+          "producer_module_id": "object_queue"
+        },
+        "object_observations": {
+          "relative_path": "key_object/grounding/object_observations.jsonl",
+          "producer_module_id": "object_ground"
+        },
+        "object_references": {
+          "relative_path": "key_object/grounding/reference_sets.json",
+          "producer_module_id": "object_ground"
+        },
+        "scene_assets": {
+          "relative_path": "scene",
+          "producer_module_id": "scene_select"
+        }
+      }
+    },
+    "video3": {
+      "video_id": "video3",
+      "title": "video3 全流程主线运行(video3)",
+      "layout_profile": "custom",
+      "route_id": "fixed-global-align",
+      "produced_code_revision": null,
+      "created_at": "2026-09-21",
+      "workspace_root": "../../workspace/full_pipeline_0920_20260921_113727/video3",
+      "source_roots": [
+        {
+          "root_id": "run_root",
+          "path": "../../workspace/full_pipeline_0920_20260921_113727/video3"
+        },
+        {
+          "root_id": "asr_root",
+          "path": "/gemini/platform/public/aigc/lss/Interns/wyn/general_video_annotation_level3_v2/workspace/full_pipeline_0920_20260921_113727/asr"
+        }
+      ],
+      "path_rewrites": [
+        {
+          "pattern": "^.*/video3/",
+          "replacement": "{run_root}/"
+        }
+      ],
+      "artifact_bindings": {
+        "pipeline_state": {
+          "relative_path": "pipeline_state.json"
+        },
+        "authoritative_asr": {
+          "relative_path": "video3.asr.jsonl",
+          "root_id": "asr_root",
+          "producer_module_id": "asr_timeline"
+        },
+        "segment_plan": {
+          "relative_path": "segment_plan/segments_window/segments.jsonl",
+          "producer_module_id": "segment_plan"
+        },
+        "shots": {
+          "relative_path": "shots/shots.jsonl",
+          "producer_module_id": "shot_split"
+        },
+        "globals": {
+          "relative_path": "global/global_clips.jsonl",
+          "producer_module_id": "global_group"
+        },
+        "global_captions": {
+          "relative_path": "captions/global/global_captions.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "attributed_asr": {
+          "relative_path": "captions/global/speaker_attributed_asr.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "shot_captions": {
+          "relative_path": "captions/shot/shot_captions.jsonl",
+          "producer_module_id": "shot_describe"
+        },
+        "segment_captions": {
+          "relative_path": "captions/segment/segment_captions.jsonl",
+          "producer_module_id": "segment_describe"
+        },
+        "segment_media": {
+          "relative_path": "segments/segments.jsonl",
+          "producer_module_id": "segment_export"
+        },
+        "tracklets": {
+          "relative_path": "tracklets",
+          "producer_module_id": "person_tracks"
+        },
+        "direct_alignment": {
+          "relative_path": "global_alignment/global_tracklet_alignment.jsonl",
+          "producer_module_id": "person_align"
+        },
+        "voice_previews": {
+          "relative_path": "voice_by_role_src/all_asr_manifest.jsonl",
+          "producer_module_id": "voice_preview"
+        },
+        "characters": {
+          "relative_path": "characters",
+          "producer_module_id": "character_pack"
+        },
+        "character_summary": {
+          "relative_path": "materialization_summary.json",
+          "producer_module_id": "character_pack"
+        },
+        "object_candidates": {
+          "relative_path": "key_object/grounding_queue.jsonl",
+          "producer_module_id": "object_queue"
+        },
+        "object_observations": {
+          "relative_path": "key_object/grounding/object_observations.jsonl",
+          "producer_module_id": "object_ground"
+        },
+        "object_references": {
+          "relative_path": "key_object/grounding/reference_sets.json",
+          "producer_module_id": "object_ground"
+        },
+        "scene_assets": {
+          "relative_path": "scene",
+          "producer_module_id": "scene_select"
+        }
+      }
+    },
+    "full_pipeline_0920_20260921_092547_i2i_tts_video1": {
+      "video_id": "video1",
+      "title": "video1 全流程主线运行(full_pipeline_0920_20260921_092547_i2i_tts_video1)",
+      "layout_profile": "custom",
+      "route_id": "fixed-global-align",
+      "produced_code_revision": null,
+      "created_at": "2026-09-22",
+      "workspace_root": "../../workspace/full_pipeline_0920_20260921_092547_i2i_tts/video1",
+      "source_roots": [
+        {
+          "root_id": "run_root",
+          "path": "../../workspace/full_pipeline_0920_20260921_092547_i2i_tts/video1"
+        },
+        {
+          "root_id": "asr_root",
+          "path": "../../workspace/full_pipeline_0920_20260921_092547_i2i_tts/asr"
+        },
+        {
+          "root_id": "video_root",
+          "path": "../../../0920"
+        }
+      ],
+      "path_rewrites": [
+        {
+          "pattern": "^.*/video1/",
+          "replacement": "{run_root}/"
+        }
+      ],
+      "artifact_bindings": {
+        "pipeline_state": {
+          "relative_path": "pipeline_state.json"
+        },
+        "source_video": {
+          "relative_path": "normalized/normalized.mp4",
+          "producer_module_id": "source_prepare"
+        },
+        "authoritative_asr": {
+          "relative_path": "video1.asr.jsonl",
+          "root_id": "asr_root",
+          "producer_module_id": "asr_timeline"
+        },
+        "segment_plan": {
+          "relative_path": "segment_plan/segments_window/segments.jsonl",
+          "producer_module_id": "segment_plan"
+        },
+        "shots": {
+          "relative_path": "shots/shots.jsonl",
+          "producer_module_id": "shot_split"
+        },
+        "globals": {
+          "relative_path": "global/global_clips.jsonl",
+          "producer_module_id": "global_group"
+        },
+        "global_captions": {
+          "relative_path": "captions/global/global_captions.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "attributed_asr": {
+          "relative_path": "captions/global/speaker_attributed_asr.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "shot_captions": {
+          "relative_path": "captions/shot/shot_captions.jsonl",
+          "producer_module_id": "shot_describe"
+        },
+        "segment_captions": {
+          "relative_path": "captions/segment/segment_captions.jsonl",
+          "producer_module_id": "segment_describe"
+        },
+        "segment_media": {
+          "relative_path": "segments/segments.jsonl",
+          "producer_module_id": "segment_export"
+        },
+        "tracklets": {
+          "relative_path": "tracklets",
+          "producer_module_id": "person_tracks"
+        },
+        "direct_alignment": {
+          "relative_path": "global_alignment/global_tracklet_alignment.jsonl",
+          "producer_module_id": "person_align"
+        },
+        "voice_previews": {
+          "relative_path": "voice_by_role_src/all_asr_manifest.jsonl",
+          "producer_module_id": "voice_preview"
+        },
+        "characters": {
+          "relative_path": "characters",
+          "producer_module_id": "character_pack"
+        },
+        "character_summary": {
+          "relative_path": "materialization_summary.json",
+          "producer_module_id": "character_pack"
+        },
+        "object_candidates": {
+          "relative_path": "key_object/grounding_queue.jsonl",
+          "producer_module_id": "object_queue"
+        },
+        "object_observations": {
+          "relative_path": "key_object/grounding/object_observations.jsonl",
+          "producer_module_id": "object_ground"
+        },
+        "object_references": {
+          "relative_path": "key_object/grounding/reference_sets.json",
+          "producer_module_id": "object_ground"
+        },
+        "scene_assets": {
+          "relative_path": "scene",
+          "producer_module_id": "scene_select"
+        },
+        "i2i_results": {
+          "relative_path": "i2i_test",
+          "producer_module_id": "i2i_review"
+        },
+        "tts_results": {
+          "relative_path": "tts_test/outputs",
+          "producer_module_id": "tts_review"
+        }
+      }
+    },
+    "full_pipeline_0920_20260921_092547_i2i_tts_video2": {
+      "video_id": "video2",
+      "title": "video2 全流程主线运行(full_pipeline_0920_20260921_092547_i2i_tts_video2)",
+      "layout_profile": "custom",
+      "route_id": "fixed-global-align",
+      "produced_code_revision": null,
+      "created_at": "2026-09-22",
+      "workspace_root": "../../workspace/full_pipeline_0920_20260921_092547_i2i_tts/video2",
+      "source_roots": [
+        {
+          "root_id": "run_root",
+          "path": "../../workspace/full_pipeline_0920_20260921_092547_i2i_tts/video2"
+        },
+        {
+          "root_id": "asr_root",
+          "path": "../../workspace/full_pipeline_0920_20260921_092547_i2i_tts/asr"
+        },
+        {
+          "root_id": "video_root",
+          "path": "../../../0920"
+        }
+      ],
+      "path_rewrites": [
+        {
+          "pattern": "^.*/video2/",
+          "replacement": "{run_root}/"
+        }
+      ],
+      "artifact_bindings": {
+        "pipeline_state": {
+          "relative_path": "pipeline_state.json"
+        },
+        "source_video": {
+          "relative_path": "normalized/normalized.mp4",
+          "producer_module_id": "source_prepare"
+        },
+        "authoritative_asr": {
+          "relative_path": "video2.asr.jsonl",
+          "root_id": "asr_root",
+          "producer_module_id": "asr_timeline"
+        },
+        "segment_plan": {
+          "relative_path": "segment_plan/segments_window/segments.jsonl",
+          "producer_module_id": "segment_plan"
+        },
+        "shots": {
+          "relative_path": "shots/shots.jsonl",
+          "producer_module_id": "shot_split"
+        },
+        "globals": {
+          "relative_path": "global/global_clips.jsonl",
+          "producer_module_id": "global_group"
+        },
+        "global_captions": {
+          "relative_path": "captions/global/global_captions.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "attributed_asr": {
+          "relative_path": "captions/global/speaker_attributed_asr.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "shot_captions": {
+          "relative_path": "captions/shot/shot_captions.jsonl",
+          "producer_module_id": "shot_describe"
+        },
+        "segment_captions": {
+          "relative_path": "captions/segment/segment_captions.jsonl",
+          "producer_module_id": "segment_describe"
+        },
+        "segment_media": {
+          "relative_path": "segments/segments.jsonl",
+          "producer_module_id": "segment_export"
+        },
+        "tracklets": {
+          "relative_path": "tracklets",
+          "producer_module_id": "person_tracks"
+        },
+        "direct_alignment": {
+          "relative_path": "global_alignment/global_tracklet_alignment.jsonl",
+          "producer_module_id": "person_align"
+        },
+        "voice_previews": {
+          "relative_path": "voice_by_role_src/all_asr_manifest.jsonl",
+          "producer_module_id": "voice_preview"
+        },
+        "characters": {
+          "relative_path": "characters",
+          "producer_module_id": "character_pack"
+        },
+        "character_summary": {
+          "relative_path": "materialization_summary.json",
+          "producer_module_id": "character_pack"
+        },
+        "object_candidates": {
+          "relative_path": "key_object/grounding_queue.jsonl",
+          "producer_module_id": "object_queue"
+        },
+        "object_observations": {
+          "relative_path": "key_object/grounding/object_observations.jsonl",
+          "producer_module_id": "object_ground"
+        },
+        "object_references": {
+          "relative_path": "key_object/grounding/reference_sets.json",
+          "producer_module_id": "object_ground"
+        },
+        "scene_assets": {
+          "relative_path": "scene",
+          "producer_module_id": "scene_select"
+        },
+        "i2i_results": {
+          "relative_path": "i2i_test",
+          "producer_module_id": "i2i_review"
+        },
+        "tts_results": {
+          "relative_path": "tts_test/outputs",
+          "producer_module_id": "tts_review"
+        }
+      }
+    },
+    "full_pipeline_0920_20260921_092547_i2i_tts_video3": {
+      "video_id": "video3",
+      "title": "video3 全流程主线运行(full_pipeline_0920_20260921_092547_i2i_tts_video3)",
+      "layout_profile": "custom",
+      "route_id": "fixed-global-align",
+      "produced_code_revision": null,
+      "created_at": "2026-09-22",
+      "workspace_root": "../../workspace/full_pipeline_0920_20260921_092547_i2i_tts/video3",
+      "source_roots": [
+        {
+          "root_id": "run_root",
+          "path": "../../workspace/full_pipeline_0920_20260921_092547_i2i_tts/video3"
+        },
+        {
+          "root_id": "asr_root",
+          "path": "../../workspace/full_pipeline_0920_20260921_092547_i2i_tts/asr"
+        },
+        {
+          "root_id": "video_root",
+          "path": "../../../0920"
+        }
+      ],
+      "path_rewrites": [
+        {
+          "pattern": "^.*/video3/",
+          "replacement": "{run_root}/"
+        }
+      ],
+      "artifact_bindings": {
+        "pipeline_state": {
+          "relative_path": "pipeline_state.json"
+        },
+        "source_video": {
+          "relative_path": "normalized/normalized.mp4",
+          "producer_module_id": "source_prepare"
+        },
+        "authoritative_asr": {
+          "relative_path": "video3.asr.jsonl",
+          "root_id": "asr_root",
+          "producer_module_id": "asr_timeline"
+        },
+        "segment_plan": {
+          "relative_path": "segment_plan/segments_window/segments.jsonl",
+          "producer_module_id": "segment_plan"
+        },
+        "shots": {
+          "relative_path": "shots/shots.jsonl",
+          "producer_module_id": "shot_split"
+        },
+        "globals": {
+          "relative_path": "global/global_clips.jsonl",
+          "producer_module_id": "global_group"
+        },
+        "global_captions": {
+          "relative_path": "captions/global/global_captions.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "attributed_asr": {
+          "relative_path": "captions/global/speaker_attributed_asr.jsonl",
+          "producer_module_id": "global_describe"
+        },
+        "shot_captions": {
+          "relative_path": "captions/shot/shot_captions.jsonl",
+          "producer_module_id": "shot_describe"
+        },
+        "segment_captions": {
+          "relative_path": "captions/segment/segment_captions.jsonl",
+          "producer_module_id": "segment_describe"
+        },
+        "segment_media": {
+          "relative_path": "segments/segments.jsonl",
+          "producer_module_id": "segment_export"
+        },
+        "tracklets": {
+          "relative_path": "tracklets",
+          "producer_module_id": "person_tracks"
+        },
+        "direct_alignment": {
+          "relative_path": "global_alignment/global_tracklet_alignment.jsonl",
+          "producer_module_id": "person_align"
+        },
+        "voice_previews": {
+          "relative_path": "voice_by_role_src/all_asr_manifest.jsonl",
+          "producer_module_id": "voice_preview"
+        },
+        "characters": {
+          "relative_path": "characters",
+          "producer_module_id": "character_pack"
+        },
+        "character_summary": {
+          "relative_path": "materialization_summary.json",
+          "producer_module_id": "character_pack"
+        },
+        "object_candidates": {
+          "relative_path": "key_object/grounding_queue.jsonl",
+          "producer_module_id": "object_queue"
+        },
+        "object_observations": {
+          "relative_path": "key_object/grounding/object_observations.jsonl",
+          "producer_module_id": "object_ground"
+        },
+        "object_references": {
+          "relative_path": "key_object/grounding/reference_sets.json",
+          "producer_module_id": "object_ground"
+        },
+        "scene_assets": {
+          "relative_path": "scene",
+          "producer_module_id": "scene_select"
+        },
+        "i2i_results": {
+          "relative_path": "i2i_test",
+          "producer_module_id": "i2i_review"
+        },
+        "tts_results": {
+          "relative_path": "tts_test/outputs",
+          "producer_module_id": "tts_review"
+        }
       }
     }
-  }
+  },
+  "deployment_note": "2026-09-21: supervised port 80; public access uses the registered Gemini JupyterLab /proxy/80/ route, which strips the proxy prefix before forwarding"
 }

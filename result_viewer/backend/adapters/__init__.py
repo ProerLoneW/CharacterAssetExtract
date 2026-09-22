@@ -16,6 +16,10 @@ from .base import ModuleAdapter, RegisteredOnlyAdapter
 from .person_assets import LegacyCharactersAdapter, TrackletsAdapter
 from .semantic_captions import GlobalCaptionAdapter, SegmentCaptionAdapter, ShotCaptionAdapter
 from .video_structure import GlobalsAdapter, SegmentMediaAdapter, ShotsAdapter
+from .mainline_assets import (GlobalAlignmentAdapter, CharactersGlobalAdapter,
+                             ObjectQueueAdapter, ObjectObservationsAdapter, SceneIndexAdapter,
+                             SegmentPlanAdapter, AsrTimelineAdapter, I2ITestAdapter,
+                             TTSTestAdapter)
 
 # adapter_id -> (module_id, 说明) —— 文档二中声明的全部能力
 REGISTERED_ADAPTER_IDS: dict[str, tuple[str, str, str]] = {
@@ -83,6 +87,15 @@ def build_registry(media: MediaService) -> dict[str, ModuleAdapter]:
         VoicePreviewAdapter,
         TrackletsAdapter,
         LegacyCharactersAdapter,
+        GlobalAlignmentAdapter,
+        CharactersGlobalAdapter,
+        ObjectQueueAdapter,
+        ObjectObservationsAdapter,
+        SceneIndexAdapter,
+        SegmentPlanAdapter,
+        AsrTimelineAdapter,
+        I2ITestAdapter,
+        TTSTestAdapter,
     ):
         adapter = cls(media)
         registry[adapter.adapter_id] = adapter

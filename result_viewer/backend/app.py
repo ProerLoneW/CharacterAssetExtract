@@ -27,6 +27,25 @@ from .module_service import ModuleService
 from .run_registry import RunRegistry
 
 
+class PrefixCompatMiddleware:
+    """接受带平台代理前缀和不带前缀的两种请求路径。
+
+    路由统一注册在 base_path 前缀下；平台代理若是"剥离前缀转发"(或本地直连),
+    请求路径不含前缀,这里补上前缀再交给路由,使两种代理行为都可用。
+    """
+
+    def __init__(self, app, prefix: str) -> None:
+        self.app = app
+        self.prefix = (prefix or "").rstrip("/")
+
+    async def __call__(self, scope, receive, send):
+        if self.prefix and scope.get("type") == "http":
+            path = scope.get("path", "")
+            if path != self.prefix and not path.startswith(self.prefix + "/"):
+                scope["path"] = self.prefix + path
+        await self.app(scope, receive, send)
+
+
 def create_app(config: RuntimeConfig) -> FastAPI:
     adapter_registry = build_registry(MediaService({}))
     parser = DocumentParser(
@@ -241,13 +260,14 @@ def main(argv: list[str] | None = None) -> None:
 
     host = args.host or config.listen_host
     port = args.port or config.service_port
-    root_path = args.root_path if args.root_path is not None else config.base_path or ""
+    root_path = args.root_path if args.root_path is not None else ""
 
     app = create_app(config)
     app.state.result_viewer["ui_build_id"] = _ui_build_id(config)
     print(f"[result_viewer] doc={'ok' if app.state.result_viewer['store'].current and app.state.result_viewer['store'].current.ok else 'ERROR'} "
           f"runs={config.allowed_runs} base_path='{config.base_path}'")
-    uvicorn.run(app, host=host, port=port, root_path=root_path, log_level="info")
+    uvicorn.run(PrefixCompatMiddleware(app, config.base_path), host=host, port=port,
+                root_path=root_path, log_level="info")
 
 
 def _ui_build_id(config: RuntimeConfig) -> str | None:

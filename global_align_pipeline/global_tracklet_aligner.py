@@ -32,6 +32,7 @@ import asyncio
 import json
 import logging
 import math
+import os
 import re
 import shutil
 import subprocess
@@ -66,6 +67,20 @@ from semantic_role_tracklet_refiner import (  # noqa: E402
 )
 
 LOGGER = logging.getLogger("global_tracklet_aligner")
+
+
+def _compact_exception(exc: BaseException, limit: int = 2000) -> str:
+    """Keep request failures useful without logging embedded video payloads.
+
+    Some OpenAI-compatible gateways echo the rejected request body in the
+    exception.  For this stage that body contains a base64 encoded stitched
+    video and can otherwise turn one warning into a hundreds-of-megabytes log.
+    """
+    message = f"{type(exc).__name__}: {exc}"
+    if len(message) <= limit:
+        return message
+    omitted = len(message) - limit
+    return f"{message[:limit]} ... <truncated {omitted} chars>"
 SCHEMA_VERSION = "global-tracklet-character-alignment-v2"
 HERE = Path(__file__).resolve().parent
 DEFAULT_PROMPT = HERE / "prompts" / "global_tracklet_alignment_prompt_en_v1.md"
@@ -480,7 +495,13 @@ async def align_one(client, semaphore, item: GlobalInput, shot_rows: Dict[int, d
             "quality_issues": [],
         }
 
-    formats = ["video_url", "input_video"]
+    # The current in-cluster OpenAI-compatible endpoint accepts the
+    # video_url content form. Its input_video fallback is rejected with a
+    # deterministic 400 (role/content validation), so do not spend a full
+    # retry on a known-invalid request. It remains opt-in for other gateways.
+    formats = ["video_url"]
+    if os.getenv("ALIGN_ALLOW_INPUT_VIDEO_FALLBACK", "0").lower() in {"1", "true", "yes"}:
+        formats.append("input_video")
     attempts: List[dict] = []
     backoff = 0.0
     started = time.perf_counter()
@@ -522,7 +543,7 @@ async def align_one(client, semaphore, item: GlobalInput, shot_rows: Dict[int, d
                     })
                     return result
                 except Exception as exc:  # noqa: BLE001 - retry boundary
-                    last_error = f"{request_format}: {type(exc).__name__}: {exc}"
+                    last_error = f"{request_format}: {_compact_exception(exc)}"
                     LOGGER.warning("%s attempt %d %s failed: %s",
                                    item.scope_id, attempt + 1, request_format, last_error)
                     attempts.append({

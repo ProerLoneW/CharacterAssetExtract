@@ -347,6 +347,33 @@ def response_diagnostic(response: Any) -> str:
 _THINK_PATTERN = re.compile(r"<think>.*?</think>", re.DOTALL | re.IGNORECASE)
 
 
+def _escape_json_control_chars(text: str) -> str:
+    """Escape raw control characters that a model placed inside JSON strings."""
+    pieces: list[str] = []
+    in_string = False
+    escaped = False
+    for char in text:
+        code = ord(char)
+        if char == '"' and not escaped:
+            in_string = not in_string
+        if in_string and code < 0x20:
+            if char == "\n":
+                pieces.append("\\n")
+            elif char == "\r":
+                pieces.append("\\r")
+            elif char == "\t":
+                pieces.append("\\t")
+            else:
+                pieces.append(f"\\u{code:04x}")
+        else:
+            pieces.append(char)
+        if char == "\\" and not escaped:
+            escaped = True
+        else:
+            escaped = False
+    return "".join(pieces)
+
+
 def parse_json_response(text: str) -> tuple[dict | None, str | None]:
     """Pull a single JSON object out of a possibly noisy free-form response."""
     cleaned = (text or "").strip()
@@ -387,7 +414,12 @@ def parse_json_response(text: str) -> tuple[dict | None, str | None]:
                         parsed = json.loads(cleaned[start : index + 1])
                         return (parsed, None) if isinstance(parsed, dict) else (None, "response is not a JSON object")
                     except json.JSONDecodeError as exc:
-                        return None, f"invalid JSON: {exc}"
+                        candidate = _escape_json_control_chars(cleaned[start : index + 1])
+                        try:
+                            parsed = json.loads(candidate)
+                            return (parsed, None) if isinstance(parsed, dict) else (None, "response is not a JSON object")
+                        except json.JSONDecodeError:
+                            return None, f"invalid JSON: {exc}"
         return None, "response does not contain a JSON object"
 
 

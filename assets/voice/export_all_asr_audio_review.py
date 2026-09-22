@@ -61,6 +61,14 @@ def number_range(value: Any, label: str) -> tuple[float, float]:
     return start, end
 
 
+def clip_relative_range(value: Any, label: str) -> tuple[float, float]:
+    if isinstance(value, (list, tuple)) and len(value) == 2:
+        start, end = float(value[0]), float(value[1])
+        if start < 0.0 < end:
+            value = [0.0, end]
+    return number_range(value, label)
+
+
 def cut_wav(source: Path, output: Path, start: float, end: float, ffmpeg: str) -> None:
     output.parent.mkdir(parents=True, exist_ok=True)
     temporary = output.with_suffix(".part.wav")
@@ -283,7 +291,7 @@ def main() -> int:
             source = Path(str(row.get("global_clip_path") or "")).expanduser().resolve()
             if not source.is_file():
                 raise FileNotFoundError(f"global clip not found: {source}")
-            start, end = number_range(row.get("time_range_sec"), f"{asr_id}.time_range_sec")
+            start, end = clip_relative_range(row.get("time_range_sec"), f"{asr_id}.time_range_sec")
             cut_wav(source, output, start, end, args.ffmpeg)
             row.update({
                 "review_status": review_status,
@@ -307,7 +315,7 @@ def main() -> int:
                 row["voice_link"] = {"status": "no_registry"}
             else:
                 try:
-                    link_start, link_end = number_range(
+                    link_start, link_end = clip_relative_range(
                         row.get("time_range_sec"), f"{asr_id}.time_range_sec")
                     row["voice_link"] = link_voice_row(
                         link_start, link_end, registry,

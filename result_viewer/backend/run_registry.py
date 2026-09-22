@@ -103,6 +103,14 @@ class RunDescriptor:
         if not absolute_or_unknown:
             return None
         text = absolute_or_unknown.replace("\\", "/")
+        # Server runs can reference real paths (including explicitly registered
+        # symlink targets), without needing a portable-checkout rewrite first.
+        direct = Path(text)
+        if direct.is_absolute():
+            target = direct.resolve()
+            for root_id, root in self.roots.items():
+                if root.contains(target) and target.is_file():
+                    return (root_id, target)
         for pattern, replacement in self.rewrites:
             if pattern.search(text):
                 rewritten = pattern.sub(replacement, text)

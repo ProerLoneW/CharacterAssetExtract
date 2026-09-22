@@ -8,6 +8,7 @@
     → 镜头描述 → 固定段规划
     → 片段描述 → 片段视频 → 人物轨迹 → 轨迹全局归属 → 角色声音候选 → 角色素材物化
     → 关键物体候选 → 物体定位分割 → 物体参考集 → 场景参考图
+    → I2I 资产还原对比 → VoxCPM2/Fish-S2-Pro 声音合成对比
 
 对应模块与入口(均为各阶段最新版):
 
@@ -26,17 +27,19 @@
     object_queue      assets/key_object/build_object_grounding_queue_v2.py (时间窗候选)
     object_ground     assets/key_object/object_grounding_segmenter_v3.py (V4 逻辑,含参考集)
     scene_select      assets/scene/important_scene_frame_extractor.py
+    i2i_review        i2i_tools/run_pipeline_assets.py
+    tts_review        tts_test/run_pipeline_tts.py
 
 每个视频一个独立工作区(--output-root/<视频名>),统一布局(与文档二 integrated/basic-flat 对齐):
 
     <ws>/shots/  global/  captions/{global,shot,segment}/  segment_plan/segments_window/
     <ws>/segments/  tracklets/  global_alignment/  characters/  voice_by_role_src/
-    <ws>/key_object/{grounding_queue.jsonl, grounding/}  scene/
+    <ws>/key_object/{grounding_queue.jsonl, grounding/}  scene/  i2i_test/  tts_test/
     <ws>/logs/<stage>.log  pipeline_state.json  pipeline_state_history.jsonl  viewer_binding.json
 
 断点续跑:阶段成功且产物标记存在则跳过;--force 重跑;--only 选择阶段;失败默认继续下一个视频。
-跑完自动生成 viewer_binding.json;--update-viewer-config 可直接并入 result_viewer/viewer_config.json
-(重启 serve.py 后网站即可浏览)。
+跑完自动生成 viewer_binding.json;--update-viewer-config 可直接并入 result_viewer/viewer_config.json。
+用 result_viewer/supervise.py 启动网站时配置变化会自动生效;单次 serve.py 启动则需重启。
 
 外部前置:ffmpeg/ffprobe、VLM 端点(OPENAI_BASE_URL/OPENAI_API_BASE/API_BASE、OPENAI_API_KEY、MODEL_NAME)、
 ASR 文件(每视频必需)、物体定位(SAM3.1/ grounding 模型)、场景(YOLO/DINOv3)、物化可选 InsightFace
@@ -101,7 +104,9 @@ def _stages(ns: argparse.Namespace) -> list[Stage]:
     # 统一降采样开启时,直接读视频的阶段(切镜/场景选帧)消费 normalized.mp4;
     # --no-normalize 时回落为原始视频,下游布局不变。
     base_video = lambda c: str(c.ws / "normalized" / "normalized.mp4") if (not ns.no_normalize) else str(c.video)
-    normalize_stage = Stage("normalize_video", "统一降采样", "normalize",
+    normalized_video = lambda c: c.ws / "normalized" / "normalized.mp4"
+    source_video = lambda c: c.video if ns.no_normalize else normalized_video(c)
+    normalize_stage = Stage("normalize_video", "统一降采样", "source_prepare",
                             lambda c: [sys.executable, _py(HERE / "preprocessing" / "normalize_video.py"),
                                        "--input", str(c.video),
                                        "--output", str(c.ws / "normalized" / "normalized.mp4"),
@@ -115,7 +120,7 @@ def _stages(ns: argparse.Namespace) -> list[Stage]:
                          "--input", base_video(c), "--output-dir", str(c.ws / "shots"),
                          "--detector", ns.detector, "--flat"],
               lambda c: c.ws / "shots" / "shots.jsonl",
-              lambda c: [c.video]),
+              lambda c: [source_video(c)]),
         Stage("aggregate_global", "全局片段聚合", "global_group",
               lambda c: [sys.executable, _py(HERE / "global_clip_aggregator.py"),
                          "--input", str(c.ws / "shots"), "--output-dir", str(c.ws / "global"),
@@ -230,8 +235,37 @@ def _stages(ns: argparse.Namespace) -> list[Stage]:
                          base_video(c),
                          "--output-dir", str(c.ws / "scene"), "--overwrite"],
               lambda c: c.ws / "scene" / Path(base_video(c)).stem / "scene_index.json",
-              lambda c: [c.video]),
+              lambda c: [source_video(c)]),
     ]
+    if not ns.no_i2i:
+        stages.append(
+            Stage("i2i_review", "I2I 资产还原对比", "i2i_review",
+                  lambda c: [sys.executable, _py(HERE / "i2i_tools" / "run_pipeline_assets.py"),
+                             "--workspace", str(c.ws),
+                             "--max-characters", str(ns.i2i_max_characters),
+                             "--max-objects", str(ns.i2i_max_objects),
+                             "--max-scenes", str(ns.i2i_max_scenes),
+                             "--model", str(ns.i2i_model),
+                             "--image-size", str(ns.i2i_image_size)]
+                            + (["--overwrite"] if ns.force else []),
+                  lambda c: c.ws / "i2i_test" / "manifest.json",
+                  lambda c: [c.ws / "materialization_summary.json",
+                             c.ws / "key_object" / "grounding" / "reference_sets.json",
+                             c.ws / "scene" / Path(base_video(c)).stem / "scene_index.json"])
+        )
+    if not ns.no_tts:
+        stages.append(
+            Stage("tts_review", "TTS 声音合成对比", "tts_review",
+                  lambda c: [sys.executable, _py(HERE / "tts_test" / "run_pipeline_tts.py"),
+                             "--workspace", str(c.ws),
+                             "--models", *ns.tts_models,
+                             "--max-speakers", str(ns.tts_max_speakers),
+                             "--num-candidates", str(ns.tts_candidates)]
+                            + (["--overwrite"] if ns.force else []),
+                  lambda c: c.ws / "tts_test" / "manifest.json",
+                  lambda c: [c.ws / "materialization_summary.json",
+                             c.ws / "captions" / "global" / "speaker_attributed_asr.jsonl"])
+        )
     # 不开 --no-normalize 时,统一降采样是第一阶段
     return stages if ns.no_normalize else [normalize_stage] + stages
 
@@ -282,6 +316,8 @@ class VideoJob:
         cmd = stage.cmd(self)
         entry.update({"status": "running", "started_at": _now(), "cmd": cmd,
                       "module_id": stage.module_id, "title": stage.title})
+        for stale_key in ("ended_at", "exit_code", "note"):
+            entry.pop(stale_key, None)
         state["stages"][stage.id] = entry
         self.save_state(state)
 
@@ -291,12 +327,25 @@ class VideoJob:
         with log_path.open("a", encoding="utf-8") as log:
             log.write(f"\n===== {_now()} =====\n{' '.join(cmd)}\n")
             log.flush()
-            proc = subprocess.run(cmd, cwd=str(HERE), stdout=log, stderr=subprocess.STDOUT,
-                                  timeout=ns.stage_timeout or None)
-        ok = proc.returncode == 0 and marker.exists()
-        self._record(state, stage, "succeeded" if ok else "failed", exit_code=proc.returncode,
-                     note=None if ok else ("产物标记缺失: " + str(marker) if proc.returncode == 0 else None))
-        print(f"  {'✓' if ok else '✗'} {stage.id:<16} exit={proc.returncode}", flush=True)
+            try:
+                proc = subprocess.run(cmd, cwd=str(HERE), stdout=log, stderr=subprocess.STDOUT,
+                                      timeout=ns.stage_timeout or None)
+                exit_code = proc.returncode
+                note = None
+            except subprocess.TimeoutExpired as exc:
+                exit_code = None
+                note = f"stage timeout after {exc.timeout}s"
+                log.write(f"\n[runner] {note}\n")
+            except OSError as exc:
+                exit_code = None
+                note = f"failed to start stage: {type(exc).__name__}: {exc}"
+                log.write(f"\n[runner] {note}\n")
+        ok = exit_code == 0 and marker.exists()
+        if not ok and note is None and exit_code == 0:
+            note = "产物标记缺失: " + str(marker)
+        self._record(state, stage, "succeeded" if ok else "failed", exit_code=exit_code,
+                     note=None if ok else note)
+        print(f"  {'✓' if ok else '✗'} {stage.id:<16} exit={exit_code}", flush=True)
         return ok
 
     def _record(self, state: dict, stage: Stage, status: str, exit_code: int | None, note: str | None) -> None:
@@ -304,6 +353,8 @@ class VideoJob:
         entry.update({"status": status, "ended_at": _now(), "exit_code": exit_code})
         if note:
             entry["note"] = note
+        else:
+            entry.pop("note", None)
         state["stages"][stage.id] = entry
         self.save_state(state)
         self.append_history({"time": _now(), "video": self.video.name, "stage": stage.id,
@@ -320,7 +371,7 @@ class VideoJob:
 # ---------------------------------------------------------------------------
 
 def write_viewer_binding(job: VideoJob, ns: argparse.Namespace) -> Path:
-    run_id = job.ws.name
+    run_id = f"{job.ws.parent.name}_{job.ws.name}"
     rel = _rel_to_config(job.ws, ns)
     binding = {
         "video_id": job.video.stem,
@@ -330,9 +381,22 @@ def write_viewer_binding(job: VideoJob, ns: argparse.Namespace) -> Path:
         "produced_code_revision": None,
         "created_at": _dt.date.today().isoformat(),
         "workspace_root": rel,
-        "source_roots": [{"root_id": "run_root", "path": rel}],
-        "path_rewrites": [{"pattern": f"^.*/{re.escape(run_id)}/", "replacement": "{run_root}/"}],
+        "source_roots": [
+            {"root_id": "run_root", "path": rel},
+            {"root_id": "asr_root", "path": _rel_path_to_config(job.asr.parent, ns)},
+            {"root_id": "video_root", "path": _rel_path_to_config(job.video.parent, ns)},
+        ],
+        "path_rewrites": [{"pattern": f"^.*/{re.escape(job.ws.name)}/", "replacement": "{run_root}/"}],
         "artifact_bindings": {
+            "pipeline_state": {"relative_path": "pipeline_state.json"},
+            "source_video": ({"relative_path": job.video.name, "root_id": "video_root",
+                              "producer_module_id": "source_prepare"} if ns.no_normalize else
+                             {"relative_path": "normalized/normalized.mp4",
+                              "producer_module_id": "source_prepare"}),
+            "authoritative_asr": {"relative_path": job.asr.name, "root_id": "asr_root",
+                                  "producer_module_id": "asr_timeline"},
+            "segment_plan": {"relative_path": "segment_plan/segments_window/segments.jsonl",
+                             "producer_module_id": "segment_plan"},
             "shots": {"relative_path": "shots/shots.jsonl", "producer_module_id": "shot_split"},
             "globals": {"relative_path": "global/global_clips.jsonl", "producer_module_id": "global_group"},
             "global_captions": {"relative_path": "captions/global/global_captions.jsonl", "producer_module_id": "global_describe"},
@@ -349,6 +413,8 @@ def write_viewer_binding(job: VideoJob, ns: argparse.Namespace) -> Path:
             "object_observations": {"relative_path": "key_object/grounding/object_observations.jsonl", "producer_module_id": "object_ground"},
             "object_references": {"relative_path": "key_object/grounding/reference_sets.json", "producer_module_id": "object_ground"},
             "scene_assets": {"relative_path": "scene", "producer_module_id": "scene_select"},
+            "i2i_results": {"relative_path": "i2i_test", "producer_module_id": "i2i_review"},
+            "tts_results": {"relative_path": "tts_test/outputs", "producer_module_id": "tts_review"},
         },
     }
     out = job.ws / "viewer_binding.json"
@@ -356,22 +422,56 @@ def write_viewer_binding(job: VideoJob, ns: argparse.Namespace) -> Path:
 
     if ns.update_viewer_config:
         cfg_path = Path(ns.update_viewer_config).resolve()
-        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
-        cfg["runs"][run_id] = binding
-        if run_id not in cfg["allowed_runs"]:
-            cfg["allowed_runs"].append(run_id)
-        cfg_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
-        print(f"  ◈ 已并入 viewer 配置 {cfg_path}(重启 serve.py 生效): run_id={run_id}", flush=True)
+        _merge_viewer_binding(cfg_path, run_id, binding)
+        print(f"  ◈ 已并入 viewer 配置 {cfg_path}: run_id={run_id}", flush=True)
     return out
 
 
+def _merge_viewer_binding(cfg_path: Path, run_id: str, binding: dict) -> None:
+    """并发安全地更新 viewer_config.json。
+
+    多轮实验可能同时结束;锁保证它们不会基于同一份旧配置互相覆盖,
+    os.replace 保证 viewer watcher 只看到完整 JSON。
+    """
+    cfg_path.parent.mkdir(parents=True, exist_ok=True)
+    import hashlib
+    import tempfile
+    config_key = hashlib.sha256(str(cfg_path).encode("utf-8")).hexdigest()[:16]
+    lock_path = Path(tempfile.gettempdir()) / f"extract_full_pipeline_viewer_{config_key}.lock"
+    with lock_path.open("a+", encoding="utf-8") as lock_file:
+        try:
+            import fcntl
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        except ImportError:  # pragma: no cover - Windows 上仍有原子替换保护
+            fcntl = None
+        try:
+            cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+            cfg.setdefault("runs", {})[run_id] = binding
+            allowed = cfg.setdefault("allowed_runs", [])
+            if run_id not in allowed:
+                allowed.append(run_id)
+            tmp_path = cfg_path.with_name(f".{cfg_path.name}.{os.getpid()}.tmp")
+            try:
+                tmp_path.write_text(json.dumps(cfg, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                os.replace(tmp_path, cfg_path)
+            finally:
+                tmp_path.unlink(missing_ok=True)
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _rel_to_config(ws: Path, ns: argparse.Namespace) -> str:
+    return _rel_path_to_config(ws, ns)
+
+
+def _rel_path_to_config(path: Path, ns: argparse.Namespace) -> str:
     cfg_dir = Path(ns.update_viewer_config).resolve().parent if ns.update_viewer_config \
         else REPO_ROOT / "result_viewer"
     try:
-        return str(Path(os.path.relpath(ws, cfg_dir)).as_posix())
+        return str(Path(os.path.relpath(path, cfg_dir)).as_posix())
     except ValueError:  # 跨盘符
-        return str(ws)
+        return str(path)
 
 
 # ---------------------------------------------------------------------------
@@ -416,10 +516,30 @@ def preflight(ns: argparse.Namespace, videos: list[Path]) -> list[str]:
         if shutil.which(tool) is None:
             problems.append(f"PATH 中找不到 {tool}(切段/归属拼接/声音预览都需要)")
     if not any(os.getenv(k) for k in VLM_BASE_ENVS):
-        problems.append("未设置 VLM 端点环境变量(OPENAI_BASE_URL / OPENAI_API_BASE / API_BASE),"
-                        "三级描述与归属阶段会失败或落到脚本默认值")
+        print("[preflight] 提示: 未设置 VLM 端点环境变量,将使用仓库内 MiMo 服务默认值", flush=True)
     if not os.getenv("MODEL_NAME"):
         print("[preflight] 提示: 未设置 MODEL_NAME,将使用 captioner 默认模型", flush=True)
+    selected = set(ns.only or [])
+    wants_i2i = not ns.no_i2i and (not selected or "i2i_review" in selected)
+    if wants_i2i:
+        env_file = HERE / "i2i_tools" / ".env"
+        has_i2i_key = bool(os.getenv("UNIAPI_API_KEY") or os.getenv("UNIAPI_KEY"))
+        if env_file.is_file() and not has_i2i_key:
+            keys = {line.split("=", 1)[0].strip() for line in env_file.read_text(encoding="utf-8").splitlines()
+                    if "=" in line and not line.lstrip().startswith("#")}
+            has_i2i_key = bool(keys & {"UNIAPI_API_KEY", "UNIAPI_KEY"})
+        if not has_i2i_key:
+            problems.append("I2I 阶段缺少 UNIAPI_API_KEY/UNIAPI_KEY(i2i_tools/.env 也未配置)")
+    wants_tts = not ns.no_tts and (not selected or "tts_review" in selected)
+    if wants_tts:
+        for executable in (HERE / "tts_test" / ".venvs" / "voxcpm" / "bin" / "python",
+                           HERE / "tts_test" / ".venvs" / "fish" / "bin" / "python"):
+            if not executable.is_file():
+                problems.append(f"TTS 阶段缺少本地环境: {executable}")
+        for model_dir in (HERE / "tts_test" / "local_models" / "VoxCPM2",
+                          HERE / "tts_test" / "local_models" / "s2-pro"):
+            if not model_dir.is_dir():
+                problems.append(f"TTS 阶段缺少模型目录: {model_dir}")
     return problems
 
 
@@ -535,9 +655,25 @@ def parse_args() -> argparse.Namespace:
     cap.add_argument("--identity-check", action="store_true", help="物化时启用 InsightFace 校验")
     cap.add_argument("--face-model", type=Path, default=None, help="InsightFace 权重路径")
 
+    generated = p.add_argument_group("生成效果对比(默认纳入全流程)")
+    generated.add_argument("--no-i2i", action="store_true", help="跳过 I2I 资产还原对比")
+    generated.add_argument("--i2i-model", default=os.getenv(
+        "UNIAPI_GEMINI_IMAGE_MODEL", "gemini-3.1-flash-image"))
+    generated.add_argument("--i2i-image-size", default="auto", choices=("auto", "1K", "2K", "4K"))
+    generated.add_argument("--i2i-max-characters", type=int, default=3, help="每视频最多还原人物数;0 为全部")
+    generated.add_argument("--i2i-max-objects", type=int, default=3, help="每视频最多还原物体数;0 为全部")
+    generated.add_argument("--i2i-max-scenes", type=int, default=3, help="每视频最多还原场景数;0 为全部")
+    generated.add_argument("--no-tts", action="store_true", help="跳过 TTS 声音合成对比")
+    generated.add_argument("--tts-models", nargs="+", choices=("voxcpm2", "s2pro"),
+                           default=["voxcpm2", "s2pro"])
+    generated.add_argument("--tts-max-speakers", type=int, default=3,
+                           help="每视频按参考音频时长最多选择的角色数;0 为全部")
+    generated.add_argument("--tts-candidates", type=int, default=1, help="每模型每角色生成候选数")
+
     viewer = p.add_argument_group("结果网站")
     viewer.add_argument("--update-viewer-config", default=None,
-                        help="全部阶段成功后把本运行并入该 viewer_config.json(如 result_viewer/viewer_config.json),需重启 serve.py")
+                        help=("全部阶段成功后把本运行并入该 viewer_config.json"
+                              "(如 result_viewer/viewer_config.json);supervise.py 启动时会热生效"))
     return p.parse_args()
 
 

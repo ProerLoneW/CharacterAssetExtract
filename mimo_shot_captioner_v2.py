@@ -296,7 +296,10 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--timeout", type=float, default=1200.0)
     parser.add_argument("--max-api-seconds", type=float, default=None)
     parser.add_argument("--retries", type=int, default=3)
-    parser.add_argument("--max-completion-tokens", type=int, default=3072)
+    # V3 emits dense subject/object/timeline JSON. 3072 tokens truncates
+    # otherwise valid responses (often leaving an unterminated fenced object),
+    # so use the same safer budget as the maintained global caption stage.
+    parser.add_argument("--max-completion-tokens", type=int, default=8192)
     parser.add_argument("--temperature", type=float, default=0.1)
     parser.add_argument("--thinking", action=argparse.BooleanOptionalAction, default=False)
     parser.add_argument("--progress", action=argparse.BooleanOptionalAction, default=True)

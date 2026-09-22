@@ -8,6 +8,8 @@ import { CaptionDetail } from './CaptionDetail'
 import { AudioEvidence } from './AudioEvidence'
 import { CharacterGallery } from './CharacterGallery'
 import { TrackletGallery } from './TrackletGallery'
+import { MediaPlayer } from '../components/MediaPlayer'
+import { JsonDrawer } from '../components/JsonDrawer'
 
 export interface RendererProps {
   module: ModuleMeta
@@ -37,7 +39,8 @@ const RENDERERS: Record<string, ComponentType<RendererProps>> = {
   'scene-gallery': GenericList,
   'generation-bundle': GenericList,
   'image-comparison': GenericList,
-  'audio-comparison': AudioEvidence,
+  // TTS 对比是“参考 + 合成结果”,不套用声音候选的准入标签。
+  'audio-comparison': GenericList,
   'artifact-browser': GenericList,
 }
 
@@ -62,6 +65,15 @@ function GenericList(props: RendererProps) {
             <h4>{item.title}</h4>
           </header>
           <p className="dim">{item.summary}</p>
+          <div className="gallery-grid">
+            {item.media_refs.map((media, index) => (
+              <figure className="gallery-item" key={index}>
+                <MediaPlayer ref_={media} />
+                <figcaption>{media.label}</figcaption>
+              </figure>
+            ))}
+          </div>
+          <JsonDrawer data={item.fields} title="结果详情" />
         </article>
       ))}
     </div>

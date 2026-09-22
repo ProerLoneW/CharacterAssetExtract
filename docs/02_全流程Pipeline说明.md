@@ -1,6 +1,6 @@
 # 视频理解与资产提取：全流程 Pipeline 说明
 
-本文件同时服务人类阅读和未来结果网站的内容加载。格式遵循[文档规范](01_系统文档规范与Agent协作.md)，网页实现遵循[网站设计](03_结果展示网站设计.md)。核验日期：2026-09-18；`1.1.0` 重排主线/支线、`1.2.0` 新增主线编排入口、`1.3.0 / 2026-09-21` 展示瘦身（非主线模块移至文末，未删除），均未改变模块事实。依据为当前源码工作树及实际结果目录；本次未执行模型推理或重跑系统。
+本文件同时服务人类阅读和未来结果网站的内容加载。格式遵循[文档规范](01_系统文档规范与Agent协作.md)，网页实现遵循[网站设计](03_结果展示网站设计.md)。核验日期：2026-09-22；`1.6.0` 在完整 0920 运行基础上补齐按实验目录隔离的网页注册、运行列表热更新、I2I/TTS 结果解析与终端便捷入口。依据为当前源码工作树及实际结果目录；最终成功仍以各工作区 `pipeline_state.json` 为准。
 
 <!-- section:system-index -->
 ## 系统索引
@@ -9,8 +9,8 @@
 {
   "doc_id": "extract-full-pipeline",
   "schema_version": "1.0.0",
-  "content_version": "1.4.0",
-  "updated_at": "2026-09-21",
+  "content_version": "1.6.0",
+  "updated_at": "2026-09-22",
   "title": "视频理解与资产提取系统",
   "summary": "从视频结构和语义描述出发，形成可追溯的人物、声音、物体、场景资产及生成效果对比。",
   "code_baseline": "0c5ddfd367388461d96bed16fc57e4560a70ace8",
@@ -28,7 +28,7 @@
     {"id":"compatibility","title":"支线与扩展模块","order":80}
   ],
   "routes": [
-    {"id":"fixed-global-align","title":"固定分段与全局人物归属","modules":["shot_split","global_group","segment_plan","asr_timeline","global_describe","shot_describe","segment_describe","segment_export","person_tracks","person_align","voice_preview","character_pack","object_queue","object_ground","scene_select"],"description":"主要讲解路径，与 run_full_pipeline.py 的 15 阶段编排一一对应（外部 ASR 为输入）；编排默认先执行统一降采样阶段（normalize_video，--no-normalize 可关），产物属于 source_prepare 模块。扩展与支线模块见文末章节。"},
+    {"id":"fixed-global-align","title":"固定分段与全局人物归属","modules":["shot_split","global_group","segment_plan","asr_timeline","global_describe","shot_describe","segment_describe","segment_export","person_tracks","person_align","voice_preview","character_pack","object_queue","object_ground","scene_select","i2i_review","tts_review"],"description":"主要讲解路径，对应 run_full_pipeline.py 的 17 个业务模块（外部 ASR 为输入）；编排默认先执行 source_prepare 的统一降采样，并把本地 I2I/TTS 生成对比作为末端阶段。--no-normalize、--no-i2i、--no-tts 可分别关闭。"},
     {"id":"basic-caption","title":"基础三级描述","modules":["source_prepare","shot_split","global_group","global_describe","shot_describe","segment_describe","segment_export"],"description":"mimo_video_pipeline.py 的六步编排；global 不含 Scheme A 的权威 ASR 归属，segment 由模型在边界约束下组织。"},
     {"id":"legacy-chr","title":"CHR 聚类与角色映射","modules":["source_prepare","shot_split","global_group","segment_plan","asr_timeline","global_describe","shot_describe","segment_describe","person_tracks","legacy_refine","legacy_identity","legacy_gallery","voice_model","voice_preview","legacy_bind"],"description":"保留逐镜头语义筛选、跨镜头身份图、CHR 画廊、投票绑定，用于兼容和对照。"},
     {"id":"audio-evidence","title":"前景声音与身份验证","modules":["source_prepare","shot_split","global_group","voice_model"],"description":"可独立运行；得到 SPK 身份和净语音证据，不自动得到视觉 S-ID。"}
@@ -61,14 +61,15 @@
                          ├→ 多帧人物轨迹 → 轨迹全局归属到 S-ID ──┐
 全局 ASR 归属 → 候选音频预览 ────────────────────────────→ 角色目录（裁图 + 候选声音）
                          │
-                         ├→ 镜头描述 → 关键物体候选 → 定位与分割 → 物体参考集
-                         └→ 全局视频 → 场景聚类与选帧 → 场景参考图
+                         ├→ 镜头描述 → 关键物体候选 → 定位与分割 → 物体参考集 ─┐
+                         └→ 全局视频 → 场景聚类与选帧 → 场景参考图 ─────────┼→ I2I 还原对比
+角色目录中的候选声音 ───────────────────────────────────────────────→ TTS 合成对比
 所有产物 + 本文档 → 只读结果网站
 
-（不在上图中展开：可选预处理、I2I 生成对比等扩展模块，以及旧 CHR 人物链、声音增强建模与兼容支路，见文末“支线、扩展与外部模块”。）
+（不在上图中展开：旧 CHR 人物链、声音增强建模、I2I 任务包导出与兼容支路。）
 ```
 
-主线只讲上图：先建时间结构与语义身份，再把语义判断落实为人物、声音、物体、场景资产；这与 run_full_pipeline.py 的 15 阶段编排一一对应（外部 ASR 为输入）。场景提取不依赖字幕或人物身份，可与语义链并行。其余模块移至文末“支线、扩展与外部模块”：可选预处理与 I2I 生成对比属于扩展；旧 CHR 人物链与轨迹直接归属的新链是替代/对照关系，不是必经步骤；声音增强链不依赖视觉人物归属，需要证据连接才能把 SPK 与 S-ID 关联。
+主线先建时间结构与语义身份，再把语义判断落实为人物、声音、物体、场景资产，最后对每视频排名靠前的有限资产运行 I2I/TTS 生成对比（默认人物/物体/场景各 3 项、声音角色 3 项，均可配置，`0` 表示全量）。场景提取不依赖字幕或人物身份，可与语义链并行；统一脚本当前按固定顺序执行以简化状态恢复。旧 CHR 人物链与轨迹直接归属的新链是替代/对照关系，不是必经步骤；声音增强链不依赖视觉人物归属，需要证据连接才能把 SPK 与 S-ID 关联。
 
 ### 身份和时间：所有页面共用的基础
 
@@ -105,7 +106,9 @@ movie_full_pipeline_20260916/
 ├── voice_by_role_src/{all_asr_manifest.jsonl,valid_manifest.jsonl,invalid_manifest.jsonl,valid/,invalid/,summary.json}
 ├── key_object/{grounding_queue.jsonl,grounding/}
 ├── scene/、scene_opt_marginal/
-├── i2i_bundles/{scene,object}/、i2i_test/、tts_test/outputs/
+├── i2i_bundles/{scene,object}/（旧导出支路）
+├── i2i_test/{manifest.json,<model>/*.png{,.json}}
+├── tts_test/{manifest.json,outputs/<model>/<scope>_<subject>/}
 └── materialization_summary.json
 ```
 
@@ -753,11 +756,12 @@ GPU 特征提取与检测是主要成本；仅改变选帧策略是否能复用�
 按场景展示主图和辅助图，支持默认与 marginal 同位置对比；标出时刻、遮挡比例和“辅助帧同场景约束”。验收参考图可定位、聚类数量与实际一致，不把 frame_score 当审美真值。
 <!-- /module:scene_select -->
 
-## 支线、扩展与外部模块（不在主线讲解路径中）
+## 生成后处理、支线与外部模块
 
-以下模块不属于主线：或是最新 15 阶段主线之外的可选/外部/基础设施步骤，或是明确降为支线的历史流程。它们仍被完整收录（模块元数据、六段说明与产物契约不变），供对照、复跑与兼容展示，但默认不出现在主线讲解路线与首屏导航中；网站里它们位于最末分组，需打开“显示兼容/实验模块”或在系统介绍中选择对应路线才能看到。
+这些模块因历史顺序仍集中在文末。source_prepare 的统一降采样以及 i2i_review/tts_review 已由当前一键脚本默认执行并列入主 route；generation_bundle、result_browse、旧人物/声音链和兼容实验仍是支线或基础设施。网站可继续把 compatibility 分组放在末尾，但不能因此把已执行的 I2I/TTS 标成外部未运行。
 
-- 扩展与外部模块（主线之外）：可选预处理（source_prepare）、图像生成任务包（generation_bundle）、图像/语音生成效果对比（i2i_review / tts_review，外部工具）、结果文件与服务（result_browse，展示基础设施，含旧 asset_viewer）。
+- 当前默认生成后处理：I2I/TTS 生成效果对比（i2i_review / tts_review，本地未提交工具已适配主线）；统一降采样属于 source_prepare，默认开启但可关闭。
+- 扩展与外部模块：图像生成任务包（generation_bundle）与结果文件/服务（result_browse，展示基础设施，含旧 asset_viewer）。
 - 声音增强支路（voice_model）：全局视频 → 前景分离 / 重叠检测 / 说话人建模 → 净语音与审核证据。可独立运行，产出 SPK 身份；不依赖视觉人物归属，也不会自动得到 S-ID。
 - 旧 CHR 人物链（legacy_refine → legacy_identity → legacy_gallery → legacy_bind）：逐镜头 LLM 语义标注 → 跨镜头身份聚类 → 视觉画廊 → 投票绑定到 S-ID。与新链（轨迹直接全局归属）是替代/对照关系，不是必经步骤。
 - 兼容与实验支路（compat_structure、asset_demo）：旧 ClipRecord 工作区结构与历史 real/stub 资产演示。
@@ -859,34 +863,34 @@ GPU 特征提取与检测是主要成本；仅改变选帧策略是否能复用�
 
 ```json pipeline-module
 {
-  "id":"i2i_review","title":"图像生成效果对比","order":180,"group":"compatibility","lifecycle":"external","implementation":"external",
-  "summary":"对比同一参考和目标下不同图像模型的输出，保留输入与参数。",
-  "depends_on":[],"optional_depends_on":["generation_bundle","legacy_gallery"],"inputs":["i2i_bundles","chr_gallery"],
-  "source_refs":["asset_viewer/pipeline_router.py"],"evidence":["sample","code"],
-  "outputs":[{"id":"i2i_results","title":"图像生成测试结果","kind":"directory","paths":{"integrated":["i2i_test"],"custom":["{output}"]},"record_key":["model","task_id"],"timebase":"none","schema":"unversioned","required":true}],
+  "id":"i2i_review","title":"图像生成效果对比","order":180,"group":"compatibility","lifecycle":"active","implementation":"existing",
+  "summary":"从当前人物、物体和场景参考资产中选择有限任务，生成可追溯的高清还原对比。",
+  "depends_on":["character_pack","object_ground","scene_select"],"optional_depends_on":["generation_bundle","legacy_gallery"],"inputs":["characters","object_references","scene_assets"],
+  "source_refs":["i2i_tools/run_pipeline_assets.py","i2i_tools/restore_character_reference.py","i2i_tools/restore_key_object_reference.py","i2i_tools/restore_scene_reference.py","i2i_tools/uniapi_gemini_image_client.py","run_full_pipeline.py"],"evidence":["code","sample"],
+  "outputs":[{"id":"i2i_results","title":"图像生成测试结果","kind":"directory","paths":{"integrated":["i2i_test"],"custom":["{output}"]},"record_key":["model","kind","task_id"],"timebase":"none","schema":"pipeline-i2i-review-v1","required":true}],
   "view":{"enabled":true,"renderer":"image-comparison","adapter":"i2i-test-v1","filters":["variant"],"primary_artifact":"i2i_results"}
 }
 ```
 
 ### 作用与判断
 
-这是系统产物的下游应用实验。外部生成工具不在本仓库核心 pipeline 内；本次核验其落盘形式和 viewer 读取逻辑，没有声称审查了所有生成模型执行代码。
+这是系统产物的下游应用实验，也是当前 `run_full_pipeline.py` 的默认末端阶段。它不改变人物归属、物体定位或场景聚类，只对已经提取的参考资产生成一组有限的质量对比；`--no-i2i` 可关闭。
 
 ### 输入与前置条件
 
-参考图、prompt、模型参数；可能来自任务包，也可能直接来自 CHR 画廊。当前样本为 CHR004 的衣服/裤子实验，不能包装成所有场景/物体包已经执行完毕。
+当前主线直接读取 `characters/<scope>/<subject>/visual/`、`key_object/grounding/reference_sets.json` 和 `scene/*/scene_index.json`，不要求先走偏旧布局的 generation_bundle。默认按人物轨迹数、物体可用参考数、场景重要度各取 3 项；`--i2i-max-* 0` 才是全量。API key 从环境或本地 `i2i_tools/.env` 读取，永不写入 manifest。
 
 ### 处理过程
 
-由外部工具生成图片并保存响应元信息；展示层按任务目标分组、按模型并列。比较时必须对齐参考与 prompt；不一致时显示“条件不同”，不能直接排名。
+`i2i_tools/run_pipeline_assets.py` 解析主线产物、固化输入选择和 prompt，复用三个原子 restoration 函数调用 Gemini 原生多图接口。每任务写 PNG 与同名 JSON，根目录写 `manifest.json`；断点续跑跳过已有图片。展示层按任务目标分组、按模型并列。
 
 ### 产物与消费
 
-样本 `i2i_test/<model>/*.png` 与同名 `*.png.json`，根含参考 JPG。路径/sidecar 由适配器读取。消费方仅为效果浏览和人工评估。
+`i2i_test/<model>/*.png` 与同名 `*.png.json`，根含 `manifest.json`；manifest 记录 kind/task_id、实际输入、输出、模型、状态和用量。消费方仅为效果浏览和人工评估。
 
 ### 异常、重跑与成本
 
-没有 sidecar 时显示“参数未收录”，不要猜模型和 prompt。生成成本由外部执行器控制，页面浏览不产生调用。新增模型文件夹不应要求改整页代码。
+单任务失败会写入 manifest 并使阶段失败，其他任务仍继续；重新运行只补缺失结果，`--force` 才覆盖。默认限制任务数以约束生成成本；全量必须显式把对应上限设为 0。页面浏览不产生调用。
 
 ### 展示与验收
 
@@ -898,11 +902,11 @@ GPU 特征提取与检测是主要成本；仅改变选帧策略是否能复用�
 
 ```json pipeline-module
 {
-  "id":"tts_review","title":"语音合成效果对比","order":190,"group":"compatibility","lifecycle":"external","implementation":"external",
-  "summary":"对比参考声音和多个 TTS 模型的合成结果及文本。",
-  "depends_on":[],"optional_depends_on":["voice_preview","voice_model","character_pack"],"inputs":["voice_previews","speaker_registry","characters"],
-  "source_refs":["asset_viewer/pipeline_router.py"],"evidence":["sample","code"],
-  "outputs":[{"id":"tts_results","title":"TTS 测试结果","kind":"directory","paths":{"integrated":["tts_test/outputs"],"custom":["{output}"]},"record_key":["model","scope","speaker"],"timebase":"none","schema":"unversioned","required":true}],
+  "id":"tts_review","title":"语音合成效果对比","order":190,"group":"compatibility","lifecycle":"active","implementation":"existing",
+  "summary":"从当前角色候选声音中选择有效参考，用 VoxCPM2 与 Fish S2 Pro 生成可比结果。",
+  "depends_on":["global_describe","character_pack"],"optional_depends_on":["voice_preview","voice_model"],"inputs":["attributed_asr","characters"],
+  "source_refs":["tts_test/run_pipeline_tts.py","tts_test/tts_voxcpm2.py","tts_test/tts_fish_s2pro.py","run_full_pipeline.py"],"evidence":["sample","code"],
+  "outputs":[{"id":"tts_results","title":"TTS 测试结果","kind":"directory","paths":{"integrated":["tts_test/outputs"],"custom":["{output}"]},"record_key":["model","scope","subject"],"timebase":"none","schema":"pipeline-tts-review-v1","required":true}],
   "view":{"enabled":true,"renderer":"audio-comparison","adapter":"tts-test-v1","filters":["scope","subject","variant"],"primary_artifact":"tts_results"}
 }
 ```
@@ -913,11 +917,11 @@ TTS 对比评估的是参考条件下的合成效果，不自动验证上游身�
 
 ### 输入与前置条件
 
-参考音频、参考文本、合成文本和模型配置；由仓库外测试工具运行。当前 viewer 按 `*/*/meta.json` 发现结果。
+读取 `characters/<scope>/<subject>/voice/valid/*.wav` 与 `speaker_attributed_asr.jsonl`。批处理器按有效参考音频总时长排序，默认每视频取前 3 个至少 5 秒的角色；`--tts-max-speakers 0` 为全量。两个模型使用各自的本地 venv 和权重，当前 viewer 按 `*/*/meta.json` 发现结果。
 
 ### 处理过程
 
-外部执行器保存合成音频/元数据 → 适配器按 scope、speaker 和模型分组 → 浏览器提供对比播放。若参考和合成文本不同，分别展示，禁止误标成同文本复刻。
+`tts_test/run_pipeline_tts.py` 为每个选中角色依次调用 VoxCPM2 和 Fish S2 Pro。两份原子脚本现兼容主线 JSONL transcript；每模型保存合成音频、合并参考、meta 和独立日志，根写 `manifest.json`。若参考和合成文本不同，分别展示，禁止误标成同文本复刻。
 
 ### 产物与消费
 
@@ -925,7 +929,7 @@ TTS 对比评估的是参考条件下的合成效果，不自动验证上游身�
 
 ### 异常、重跑与成本
 
-缺音频、合成失败、参数未记录分别显示。运行耗时/质量评分没有采集就显示“未记录”，不能虚构。浏览不触发合成。
+不足 5 秒的候选默认不进入对比；单模型/角色失败会写 manifest 并使阶段失败，其他任务继续。已有 meta 默认跳过，`--force` 才覆盖。运行耗时/质量评分没有采集就显示“未记录”，不能虚构；浏览不触发合成。
 
 ### 展示与验收
 
@@ -1258,7 +1262,8 @@ stub 仍可能调用 ffmpeg 抽帧/音频；real 会用 GPU，不能为试网页
 
 | 意图 | 入口/实际覆盖 | 注意 |
 |---|---|---|
-| 全流程主线一键编排 | `run_full_pipeline.py --input-dir <目录> --asr-dir <ASR 目录>` | 切镜→聚合→全局描述(说话归属)→镜头描述→固定段规划→片段描述→切段→轨迹→全局归属→声音候选→物化→物体候选→物体定位分割+参考集→场景参考图，共 15 阶段，全部为最新逻辑（speaker_v2 / shot_v3 / fixed_segments_v4 / 轨迹构建器 / 全局归属 / 物化器 / grounding_queue_v2 / segmenter_v4 / 场景提取器），不含旧 CHR 链；每视频独立工作区，`pipeline_state.json` 支持断点续跑；ASR/VLM/GPU/ffmpeg 为外部前置，预检缺失会拒绝启动；跑完可 `--update-viewer-config` 并入结果网站 |
+| 全流程主线一键编排 | `scripts/run_latest_pipeline.sh --input-dir <目录> --asr-dir <ASR 目录> --result-name <实验名>`(底层为 `run_full_pipeline.py`) | 默认命令共 18 个执行 stage：统一降采样 + 原 15 个结构/描述/资产 stage + I2I/TTS 两个生成对比 stage；业务模块为 source_prepare 与 route 中 17 项。I2I 默认每类 3 项、TTS 默认 3 个角色×2 模型，均可配置或用 `--no-i2i/--no-tts` 关闭；不含旧 CHR 链。每视频独立工作区，`pipeline_state.json` 支持断点续跑；ASR、VLM、GPU、本地权重、ffmpeg 和 I2I key 为前置。便捷脚本落盘到 `../workspace/<实验名>`、同时显示/保存控制台日志，并以 `<实验名>_<视频名>` 独立注册网页 |
+| 结果网站热更新 | `scripts/serve_result_viewer_hot.sh`(底层为 `result_viewer/supervise.py`) | 监视原子更新的 `viewer_config.json`并自动重载后端；前端定时重取运行列表。单次 `serve.py` 不会重读运行配置；部署新前端后旧标签页需首次手动刷新，后续新实验可自动出现 |
 | 从视频跑基础三级描述 | `mimo_video_pipeline.py`：split-shots → aggregate-global → global-caption → shot-caption → segment-caption → cut-segments | 旧版 captioner；没有轨迹、声音、物体、场景、人物物化 |
 | 固定结构的 Scheme A | `mimo_video_pipeline_scheme_a.py`：all 只含 global/shot/fixed-segment 三步描述 | 必须有 ASR 与分段；上游结构和下游物理切段另行运行 |
 | 新人物归属与物化 | `global_align_pipeline/run_global_align_pipeline.sh` 的两步 | 默认路径需覆盖；此 shell 未先自动 dry-run；物化有清目录行为 |
@@ -1266,6 +1271,8 @@ stub 仍可能调用 ffmpeg 抽帧/音频；real 会用 GPU，不能为试网页
 | 声音候选预览 | `assets/voice/export_all_asr_audio_review.py` | 普通候选分类与带 registry 的审核资产是不同层次 |
 | 旧 CHR 链 | builder → refiner_v3 → registry_builder → asset_bank → role_aligner | 同一策略视图贯穿，不插进新链当必经步骤 |
 | I2I 包导出 | `assets/character_role_aligner.py --export-i2i-bundles` | 独立导出分支，核对 workspace 布局 |
+| 当前主线 I2I 生成对比 | `i2i_tools/run_pipeline_assets.py --workspace <视频工作区>` | 直接消费当前角色/物体/场景产物；默认有限任务，`--dry-run` 先核对选择，不依赖旧 bundle 布局 |
+| 当前主线 TTS 对比 | `tts_test/run_pipeline_tts.py --workspace <视频工作区>` | 按候选声音时长选角色，分别调用本地 VoxCPM2 与 Fish S2 Pro 环境；原子 TTS 脚本兼容 JSON/JSONL transcript |
 
 共享模块并不意味着统一执行框架：`mimo_caption_client.py` 管理请求、视频编码、JSON 解析、manifest/prompt 辅助；`common/vlm.py` 是另一公共 VLM 能力，不能假设所有调用都经过它；`common/ffmpeg.py/jsonl.py/workspace.py/clip_store.py` 主要服务相应迁移模块；`schema/records.py` 是兼容结构 schema。`common/vlm_original.py` 为旧实现对照，变更前先查实际 import。`prompts/` 变化属于接口变化影响源，必须检查输出校验和缓存。
 
@@ -1304,11 +1311,13 @@ stub 仍可能调用 ffmpeg 抽帧/音频；real 会用 GPU，不能为试网页
 | G12 | `.gitignore` 忽略 *.md；旧长文档本身大多不在 git ls-files 中 | 必须按文档一显式纳入三份文档，否则 diff 驱动维护不成立 |
 | G13 | 没有统一的 run manifest、输入哈希和跨所有模块的原子发布协议 | 未来索引层提供运行绑定和 provenance；现阶段不能推断产物全部由当前 commit 生成 |
 | G14 | fixed_v4 容许兼容 clip_ids 的数字提取，m04 有派生子 clip | 验证派生 ID 映射，不保证无损直连 |
-| G15 | I2I 导出仍偏旧布局及 role_to_chr，0916 整合布局经过整理 | 需明确 adapter/导出绑定，新链完整接入尚未核验 |
+| G15 | 旧 generation_bundle 导出仍偏旧布局及 role_to_chr；新 `run_pipeline_assets.py` 已绕开该导出，直接适配当前主线 characters/object references/scene index | 两条路线分开解释；不能把新直接生成 manifest 当成旧 i2i_bundles，也不能声称旧导出已修复 |
 | G16 | 2026-09-21 五项增强（normalize_video 首阶段、semsim 检测器、场景提取三选项、CocktailASR 多参考多说话人、TransNet/SCRL 权重环境变量）均为仅代码核验，本机无运行环境未实测 | 服务器实验前不得把默认行为变化当作已验证效果；run_full_pipeline 默认开启降采样会改变后续所有产物口径 |
 | G17 | person_align/character_pack schema 已升 v2（entity_nature、identity_check、depicted_references），文档样本仍来自 v1 运行 | 适配器解析 v2 新字段时对 v1 旧样本按缺省 uncertain 处理；新旧运行不能混在一份 characters 里 |
+| G18 | 旧 0920 运行暴露出对齐接口异常会把内嵌视频 base64 写入日志，单文件膨胀到约 599 MiB；当前工作树已将异常截断到 2000 字符 | 旧日志仍是历史证据，不删除；新运行验收需确认 person_align 日志不再随请求体尺寸增长 |
+| G19 | I2I/TTS 是生成效果抽样，不是上游资产审核；默认上限会遗漏低排名资产，设置 0 才全量且成本显著增加 | 页面和汇总必须展示选择规则、分母和 task_count，不能把抽样成功数写成全资产覆盖率 |
 
-优先级：网站一期先解决 G04/G05/G08 的真实展示、G10 的文档解析、G11 的路径读取、G12 的文档版本管理；业务算法变化是独立开发任务。本文没有据此修改任何实现。
+优先级：网站一期先解决 G04/G05/G08 的真实展示、G10 的文档解析、G11 的路径读取、G12 的文档版本管理；业务算法变化仍是独立开发任务。本次只为当前运行补了生成后处理编排、输入适配、状态记录和日志限幅，没有改上游语义算法。
 <!-- /section:known-gaps -->
 
 <!-- section:evidence-baseline -->
@@ -1319,6 +1328,8 @@ stub 仍可能调用 ffmpeg 抽帧/音频；real 会用 GPU，不能为试网页
 核验样本根：`../workspace/movie_full_pipeline_20260916`。同时查看了 `../workspace/movie_full_pipeline_20260912_v4/assets/visual_person_v2` 的中间结果目录。样本生产 commit 未被统一记录，本次不将当前 HEAD 当作样本的生产版本。
 
 Git HEAD：`0c5ddfd367388461d96bed16fc57e4560a70ace8`。初始工作树有 4 个已跟踪修改文件：`.gitignore`、`assets/voice/speaker_registry_builder.py`、`global_align_pipeline/global_tracklet_aligner.py`、`global_align_pipeline/global_character_materializer.py`。未跟踪内容包括 `asset_viewer/`、`assets/voice/cocktail_asr.py`、`test_cocktail_asr.py` 和少量 pycache。本次保留这些用户改动，未提交/暂存。
+
+2026-09-21 本轮运行前实际 HEAD 为 `e30f8dcb9fb59fe340f051d9cc46a8f24c1bbb99`（与 `origin/main` 一致），叠加新的脏工作树；其中 `i2i_tools/`、`tts_test/` 均未跟踪，但被明确要求纳入本轮流程。本轮不把全局 `code_baseline` 推进到该 HEAD，因为其余 27 模块未重新全量复核；本轮新增/修改文件及 0920 新运行状态构成局部证据。
 
 关键文件内容指纹用于下一 Agent 判断是否可复用本次结论；未列文件仍按基线 diff 和模块 source_refs 核验：
 
@@ -1336,6 +1347,10 @@ Git HEAD：`0c5ddfd367388461d96bed16fc57e4560a70ace8`。初始工作树有 4 个
 | `.gitignore` | `26e5694ec51042249c409061589f87a13d894c7ec1011f67384bb4b942c91a52` |
 
 本次证据覆盖入口编排、核心算法决策与落盘代码、已有 viewer 的读取/服务逻辑、代表 JSON/JSONL 和目录结构。没有验证模型端点可用性、GPU 运行、全量媒体内容、所有历史脚本组合、实际代理连通性或语义标注准确率。所有设计指标均留在文档三，不能反过来当作当前系统验收结果。
+
+`1.6.0 / 2026-09-22`：增加 `scripts/run_latest_pipeline.sh` 与 `scripts/serve_result_viewer_hot.sh`；viewer 运行 ID 改为实验目录+视频名以保留同视频多流程；配置注册改为并发加锁和原子替换；守护进程热重载后端、前端轮询运行列表；新增 I2I/TTS 真实产物网页适配器。
+
+`1.5.0 / 2026-09-21`：把本地未跟踪 `i2i_tools/` 与 `tts_test/` 适配到当前角色/物体/场景/归属 ASR 布局并加入 `run_full_pipeline.py` 默认末端阶段；默认做有限生成对比、写独立 manifest，增加关闭/上限参数；修复 TTS JSONL transcript、runner 超时状态和 person_align 巨型异常日志问题，登记 G18/G19。
 
 内容更新记录：`1.4.0 / 2026-09-21`，登记五项未运行验证的代码增强：统一降采样阶段（source_prepare 新增 normalize_video 产物与 run_full_pipeline 默认首阶段）、global_group 的 semsim 免训练检测器与 auto 回落顺序/环境变量/--no-export 容忍、scene_select 三个 opt-in 选项、voice_model 的 CocktailASR 多参考多说话人、person_align/character_pack schema v2（entity_nature/identity_check/depicted_references，此三项为更早会话实现、本次补登记）；已知差异新增 G16/G17。`1.3.0 / 2026-09-21`，展示瘦身：主线收敛为与 run_full_pipeline.py 15 阶段编排对应的 15 个模块，source_prepare、generation_bundle、i2i_review、tts_review、result_browse 移入文末“支线、扩展与外部模块”章节与最末分组（移动而非删除）；默认路线与总览图同步。`1.2.0 / 2026-09-21`，新增全流程主线一键编排入口 run_full_pipeline.py（15 阶段、最新逻辑、断点续跑、可并入结果网站），入口表与主线路线说明同步。`1.1.0 / 2026-09-20`，主线/支线重排：主线模块（视频结构、内容理解、人物资产、物体、场景、生成对比、结果服务）前置并按流程重编号；旧 CHR 人物链、声音增强建模与兼容支路移入文末“支线与历史兼容模块”章节与最末分组；总览图改为只画主线。模块事实、依赖与产物契约未变。`1.0.0 / 2026-09-18`，建立 27 个业务模块的统一说明及网站读取元数据，区分现有实现、外部结果、兼容分支和待建展示层。
 <!-- /section:evidence-baseline -->

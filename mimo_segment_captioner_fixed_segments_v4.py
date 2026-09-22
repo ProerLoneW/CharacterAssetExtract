@@ -98,10 +98,7 @@ def fixed_plan_for_global(global_record: dict[str, Any]) -> list[dict[str, Any]]
             raw_ids = row.get("clip_ids", [])
         shot_ids = [value for item in raw_ids if (value := _numeric_id(item)) in expected_set]
         if not shot_ids:
-            raise ValueError(
-                f"fixed segment {row['segment_id']} overlaps global {global_record.get('global_id')} "
-                "but has no matching shot_ids/clip_ids"
-            )
+            continue
         selected.append({
             "upstream_segment_id": str(row["segment_id"]),
             "shot_ids": shot_ids,
@@ -182,14 +179,18 @@ def build_input_text(
     ])
 
 
-def _valid_model_objects(row: dict[str, Any], valid_refs: set[str]) -> tuple[list[dict], int]:
+def _valid_model_objects(row: dict[str, Any], valid_refs: set[str],
+                         excluded: set[str]) -> tuple[list[dict], int]:
     output = []
     ignored = 0
     supplied = row.get("key_object_candidates")
     for candidate in supplied if isinstance(supplied, list) else []:
         refs = candidate.get("source_candidate_refs") if isinstance(candidate, dict) else None
-        if isinstance(refs, list) and refs and all(str(ref) in valid_refs for ref in refs):
+        if (isinstance(refs, list) and refs
+                and all(str(ref) in valid_refs for ref in refs)
+                and not any(str(ref) in excluded for ref in refs)):
             output.append(candidate)
+            excluded.update(str(ref) for ref in refs)
         else:
             ignored += 1
     return output, ignored
@@ -220,17 +221,26 @@ def validate_and_enrich(
             f"fixed segment ID/order mismatch: expected={expected_ids}, actual={list(by_id)}"
         )
 
-    inventory_refs = {
-        str(item["candidate_ref"]) for item in object_v2.object_candidate_inventory(shots)
-    }
+    shot_map = {int(shot["shot_id"]): shot for shot in shots}
     ignored_dialogue = 0
     ignored_objects = 0
     synthesized = []
     for plan_row in plan:
+        segment_refs = {
+            str(item["candidate_ref"])
+            for shot_id in plan_row["shot_ids"]
+            if shot_id in shot_map
+            for item in object_v2.object_candidate_inventory([shot_map[shot_id]])
+        }
         model = copy.deepcopy(by_id[plan_row["upstream_segment_id"]])
         dialogue = model.get("dialogue")
         ignored_dialogue += len(dialogue) if isinstance(dialogue, list) else 0
-        objects, ignored = _valid_model_objects(model, inventory_refs)
+        rejected = model.get("rejected_object_candidate_refs")
+        model["rejected_object_candidate_refs"] = [
+            ref for ref in rejected if str(ref) in segment_refs
+        ] if isinstance(rejected, list) else []
+        excluded = set(model["rejected_object_candidate_refs"])
+        objects, ignored = _valid_model_objects(model, segment_refs, excluded)
         ignored_objects += ignored
         model.pop("upstream_segment_id", None)
         model.pop("segment_id", None)
@@ -240,10 +250,6 @@ def validate_and_enrich(
         model["shot_ids"] = copy.deepcopy(plan_row["shot_ids"])
         model["dialogue"] = []
         model["key_object_candidates"] = objects
-        rejected = model.get("rejected_object_candidate_refs")
-        model["rejected_object_candidate_refs"] = [
-            ref for ref in rejected if str(ref) in inventory_refs
-        ] if isinstance(rejected, list) else []
         synthesized.append(model)
 
     compatible_payload = {

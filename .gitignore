@@ -2,11 +2,26 @@
 *__pycache__/*
 *movie*
 local_models/
+**/local_models/
 _backup*
+*.env
+**/.env
 !docs/*
 !prompts/
 !prompts/**
+!*/prompts/*
 !*README.md
+!*PROMPTS*.md
+!*prompts*.md
+
+# Local runtimes, vendored checkouts and generated experiment outputs.
+/tts_test/.venvs/
+/tts_test/outputs/
+/tts_test/third_party/fish-speech/
+/i2i_tools/outputs/
+
+# TypeScript incremental compiler cache; the deployable frontend_dist stays tracked.
+*.tsbuildinfo
 
 
 .git/

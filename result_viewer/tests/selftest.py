@@ -30,7 +30,8 @@ from backend.config import load_config  # noqa: E402
 from backend.document_parser import DocumentParser  # noqa: E402
 from backend.envelope import MediaRef  # noqa: E402
 from backend.media_service import MediaService  # noqa: E402
-from backend.run_registry import RunRegistry  # noqa: E402
+from backend.run_registry import (ArtifactBinding, RunDescriptor, RunRegistry,
+                                  SourceRoot)  # noqa: E402
 from backend.adapters.base import RunContext  # noqa: E402
 
 PASS = 0
@@ -228,6 +229,46 @@ def test_run_and_adapters() -> None:
         check("越界 media_id 被拒绝", True)
 
 
+def test_character_schema_compatibility() -> None:
+    print("[4] 当前主线角色物化 schema 兼容")
+    with tempfile.TemporaryDirectory() as temporary:
+        root = Path(temporary).resolve()
+        characters = root / "characters"
+        for subject, schema in (
+            ("S1", "global-character-materialization-v1"),
+            ("S2", "global-character-materialization-v2"),
+        ):
+            role_root = characters / "global_0001" / subject
+            face = role_root / "visual" / "face" / "face_001.jpg"
+            face.parent.mkdir(parents=True, exist_ok=True)
+            face.write_bytes(b"test-image")
+            (role_root / "role_character.json").write_text(
+                '{"schema_version":"%s","semantic_scope_id":"global_0001",'
+                '"subject_id":"%s","tracklet_count":1}\n' % (schema, subject),
+                encoding="utf-8",
+            )
+
+        run = RunDescriptor(
+            run_id="schema-compat", video_id="sample", title="schema compatibility",
+            layout_profile="custom", route_id="fixed-global-align",
+            created_at=None, produced_code_revision=None,
+        )
+        run.roots["run_root"] = SourceRoot("run_root", root)
+        run.bindings["characters"] = ArtifactBinding(
+            artifact_id="characters", run_id=run.run_id, profile="custom",
+            root_id="run_root", relative_path="characters",
+        )
+        ctx = RunContext(run)
+        registry = build_registry(MediaService({run.run_id: run}))
+        adapter = registry["characters-global-v1"]
+        rows = adapter.entities(run, ctx)
+        check("characters-global 同时读取 v1/v2", len(rows) == 2,
+              f"actual={[(r.key.local_id, r.fields.get('schema_version')) for r in rows]}")
+        check("v2 角色视觉素材可读取", all(
+            row.media_refs and row.media_refs[0].availability == "available" for row in rows
+        ))
+
+
 def main() -> int:
     arg = argparse.ArgumentParser()
     arg.add_argument("--config", default=str(REPO / "viewer_config.json"))
@@ -236,6 +277,7 @@ def main() -> int:
     test_real_document()
     test_rejections()
     test_run_and_adapters()
+    test_character_schema_compatibility()
 
     print(f"\n共 {PASS} 项通过,{FAIL} 项失败")
     return 1 if FAIL else 0

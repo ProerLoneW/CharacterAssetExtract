@@ -64,10 +64,37 @@ python result_viewer/serve.py --root-path /gemini_web/result_viewer/<代理段>/
 
 暴露给他人前确认:`viewer_config.json` 的 `allowed_runs`/`source_roots` 只登记了要展示的运行目录(服务是只读的,媒体读取被限制在登记根内);Windows 本机首次对外监听可能需放行防火墙。常驻部署建议用 systemd/supervisor 托管同一条命令,不要依赖交互式终端。
 
+## 新实验注册与热更新
+
+`serve.py` 是单次启动,不会重读运行配置。需要新实验自动出现时,在仓库根目录使用守护入口:
+
+```sh
+scripts/serve_result_viewer_hot.sh
+# 或直接:
+python -u result_viewer/supervise.py --config result_viewer/viewer_config.json
+```
+
+`supervise.py` 每 3 秒检查一次配置,只在 JSON 完整有效时重启后端;前端每 3 秒重取运行列表。
+因此由 `run_full_pipeline.py --update-viewer-config ...` 原子注册的结果通常在 3–6 秒内出现,
+不需手动重启或刷新页面。首次部署带运行列表轮询的新前端时,已打开的旧页面需手动刷新一次。
+
+当前主线的便捷入口同时保存终端日志并默认注册网页:
+
+```sh
+scripts/run_latest_pipeline.sh \
+  --input-dir /path/to/videos \
+  --asr-dir /path/to/asr \
+  --result-name my_new_run \
+  -- --caption-workers 3 --align-concurrency 2
+```
+
+结果落在 `../workspace/my_new_run/`,终端输出同步保存到 `console.log`。每个视频的
+run ID 为 `<result-name>_<video-stem>`,所以同名视频的不同流程/实验不会覆盖旧网页条目。
+
 ## 数据源
 
-当前绑定本仓库内的 `movie_full_pipeline_20260912_v4`(旧链整合运行,3 个 global)。
-所有绑定在 `viewer_config.json` 中显式声明(文档三 §6.1 的 custom 布局):
+`viewer_config.json` 同时保留历史旧链运行和按实验目录名区分的当前主线运行。
+所有绑定都显式声明(文档三 §6.1 的 custom 布局),不会按视频名猜测或覆盖:
 
 | 产物 | 相对路径 | 模块 |
 |---|---|---|
@@ -90,6 +117,16 @@ I2I 等本运行未收录的模块显示 `未收录` 状态而不是空列表。
 前端使用相对路径 fetch + `vite base:'./'`,页面/API/媒体自动走同一前缀;
 启动时用 `--root-path` 匹配代理是否剥离前缀(文档三 §9.2)。
 
+Gemini Job 已注册 JupyterLab 时，优先使用 `jupyter_server_proxy` 暴露服务：
+
+```text
+https://<平台地址>/gemini_web/gemini_jupyterlab/~<平台地址>~<端口>~/<JOB_ID>/proxy/<服务端口>/
+```
+
+该代理会剥离 `/proxy/<服务端口>/` 后再转发，因此 `base_path` 保持为空，服务监听
+`0.0.0.0:<服务端口>`。当前 Job 的服务端口为 80。访问者需要先登录 Gemini/JupyterLab；
+不要把 Jupyter token 放进分享链接。
+
 ## 与设计文档的验收对照
 
 | 文档三验收项 | 状态 |
@@ -105,10 +142,9 @@ I2I 等本运行未收录的模块显示 `未收录` 状态而不是空列表。
 
 ## 尚未覆盖(交接)
 
-- `global-alignment-v1`(person_align)、`characters-global-v1`(新链物化)、object/scene/I2I/TTS
-  等 18 个 adapter 已登记(文档校验可解析)但未实现数据解析;绑定后返回明确的
-  "已注册但本版本未实现数据解析" 状态。schema 依据见文档二对应模块,接入时新增
-  `adapters/*.py` 并在 `adapters/__init__.py` 注册即可。
+- 当前主线的固定分段、ASR、人物归属/物化、物体、场景、I2I 与 TTS 已有真实数据适配器。
+  旧 CHR/声音建模、generation bundle 和演示/兼容模块中仍有只登记未解析的 adapter;
+  绑定后会返回明确的“已注册但未实现”状态,不伪装为空成功。
 - 0916 运行(workspace 下)未在本机;如需接入,在 viewer_config.json 增加一个 run
   并按 `integrated` 布局绑定产物。
 - 旧 URL 兼容映射、SSE 推送、`.viewer_cache/docs` 快照缓存(文档三 §5.4)未实现。
@@ -116,7 +152,7 @@ I2I 等本运行未收录的模块显示 `未收录` 状态而不是空列表。
 
 ## 自测记录
 
-- `python tests/selftest.py`:39 项全部通过(2026-09-20)。
+- `python tests/selftest.py`:41 项全部通过(2026-09-22)，包含角色物化 schema v1/v2 兼容；新主线 I2I/TTS 适配另用实际 0920 运行做 API/媒体可读性验证。
   覆盖真实文档解析、16 类非法文档拒绝、适配器真实计数(58/72 候选、190/143/59 轨迹)、
   媒体重写与越界拒绝。
 - 浏览器端到端(2026-09-20):系统介绍/声音候选/角色画廊/轨迹/全局描述/未收录模块
